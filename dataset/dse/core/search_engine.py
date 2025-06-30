@@ -285,8 +285,9 @@ class SearchEngine:
             # Run different search strategies based on predictor type
             if predictor in ['analytical', 'both']:
                 logger.info("Running analytical search...")
+                # Use gradient descent for analytical predictor to leverage differentiable models
                 analytical_results = self.search(
-                    strategy="random",  # Start with random search for robustness
+                    strategy="gradient_descent",  # Use gradient descent for analytical models
                     n_calls=20,  # Reasonable number for quick results
                     n_initial_points=5
                 )
