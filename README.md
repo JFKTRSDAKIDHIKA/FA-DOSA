@@ -1,161 +1,272 @@
-# DOSA: Differentiable Model-Based One-Loop Search for DNN Accelerators
-In this work, we build a differentiable analytical model to enable mapping-first design space exploration of deep learning accelerator designs. We also apply deep learning to adapt this model to the Gemmini accelerator's RTL implementation.
+# 🚀 DOSA深度学习加速器设计框架使用指南
 
-For more details, please refer to:
-- [MICRO'23 DOSA Paper](https://people.eecs.berkeley.edu/~ysshao/assets/papers/dosa-micro2023.pdf)
-- [MICRO'23 DOSA Slides](https://people.eecs.berkeley.edu/~ysshao/assets/talks/dosa2023-micro-slides.pdf)
+## 📋 项目简介
 
-If used for research, please cite DOSA by the following publication:
+**DOSA (Differentiable Model-Based One-Loop Search for DNN Accelerators)** 是一个用于深度学习加速器设计空间探索的现代化框架。
 
-```BibTex
-@inproceedings{
-  hong2023dosa,
-  title={DOSA: Differentiable Model-Based One-Loop Search for DNN Accelerators},
-  author={Charles Hong and Qijing Huang and Grace Dinh and Mahesh Subedar and Yakun Sophia Shao},
-  booktitle={IEEE/ACM International Symposium on Microarchitecture (MICRO)},
-  year={2023},
-  url={https://people.eecs.berkeley.edu/~ysshao/assets/papers/dosa-micro2023.pdf}
-}
-```
+## 🎯 主要功能
 
-## Installation
-Requires `python=3.10`.
+- **网络级设计空间探索**: 自动搜索最优硬件配置
+- **多种搜索策略**: 贝叶斯优化、梯度下降、随机搜索
+- **智能预测器**: 分析模型、深度学习模型、混合模型
+- **硬件架构生成**: 自动生成和优化硬件配置
+- **可视化分析**: 丰富的图表和性能分析工具
 
-### DOSA
-On a user machine with Python 3.10, clone DOSA:
-```
-git clone https://github.com/ucb-bar/dosa.git
+## 🚀 快速开始
+
+### 环境激活
+```bash
+conda activate dosa
+cd /path/to/dosa
 ```
 
-First, acquire a [Gurobi optimizer license](https://www.gurobi.com/features/academic-named-user-license/) and download it to path of choice **($license_path)**. Next, run the following:
-```
-export GRB_LICENSE_FILE=($license_path)
-cd dosa
-pip3 install -e .
+### 基本使用
+
+#### 1. 简单搜索实验
+```bash
+python dosa_search.py \
+    --workload bert \
+    --arch_name gemmini \
+    --dataset_path ./data/timeloop_dataset/dataset.csv \
+    --predictor analytical
 ```
 
-### Timeloop and Accelergy
-Install Timeloop and Accelergy on the user machine. The following dependencies are required
-(command provided for Debian-based systems):
-```
-sudo apt install scons libconfig++-dev libboost-dev libboost-iostreams-dev libboost-serialization-dev libyaml-cpp-dev libncurses-dev libtinfo-dev libgpm-dev git build-essential python3-pip
-```
-
-Timeloop and Accelergy are available as submodules of the DOSA repository. Install Accelergy and its plug-ins. Make sure you add CACTI and its executables to your **PATH**.
-
-Within `dosa`:
-```
-git submodule update --init --recursive
-cd accelergy-timeloop-infrastructure/src/accelergy
-pip3 install .
-cd ../cacti
-make
-cd ..
-mv cacti ~/.local/bin
-cd accelergy-cacti-plug-in
-pip3 install .
-cd ../accelergy-aladdin-plug-in
-pip3 install .
-cd ../accelergy-table-based-plug-ins
-pip3 install .
-accelergy
-accelergyTables
-export PATH=$PATH:~/.local/bin/cacti
+#### 2. 强制CPU模式（推荐）
+```bash
+python dosa_search.py \
+    --workload bert \
+    --arch_name gemmini \
+    --dataset_path ./data/timeloop_dataset/dataset.csv \
+    --predictor analytical \
+    --use_cpu
 ```
 
-Install Timeloop and add its executables to your **PATH**:
-```
-cd ../timeloop/src
-ln -s ../pat-public/src/pat
-cd ..
-scons --accelergy --static -j4
-export PATH=$PATH:$(pwd)/build
-```
-
-## Running the Experiments
-> If you run into errors at any point in this section, check that `accelergy`, `cacti` and `timeloop-model` are accessible in your environment, else add them to your **PATH**.
-
-### Figure 4: Analytical model correlation with Timeloop
-
-On the **user machine**, run the following commands. This will correlate DOSA’s differentiable model against Timeloop for our 10,000 point dataset and store the error plots to “output_dir/error_<metric>.png”.
-```
-cd ../../..
-./fig4.sh
+#### 3. 使用深度学习预测器
+```bash
+python dosa_search.py \
+    --workload resnet50 \
+    --arch_name gemmini \
+    --dataset_path ./data/timeloop_dataset/dataset.csv \
+    --predictor dnn \
+    --use_cpu
 ```
 
-### Figure 7: Optimization of Gemmini-TL versus baseline algorithms
-In the same environment, run the following script, selecting one workload:
-```
-./fig7.sh (unet|resnet50|bert|retinanet)
-```
-
-This will take several hours to run, per workload, and generate a plot at “output_dir/network_searcher_<workload>log<timestamp >.png”. This corresponds to the plot to Figure 5, but over one run rather than averaged over 5. Results should fall within or close to the confidence bounds of the original plot.
-
-### Figure 8: Comparison to hand-tuned accelerators
-Only after running `fig7.sh` for the corresponding workload, run:
-```
-./fig8.sh (unet|resnet50|bert|retinanet)
+#### 4. 只生成可视化图表
+```bash
+python dosa_search.py \
+    --workload bert \
+    --dataset_path ./data/timeloop_dataset/dataset.csv \
+    --plot_only \
+    --use_cpu
 ```
 
-The plots will be generated at the location "output_dir/arch_compare_<workload>_<timestamp>.png". Since these are based on the results of one run rather than averaged over 5, results here will again vary slightly compared to the original plot.
+## 📝 命令行参数详解
 
-### Figures 10 and 11: Gemmini-RTL performance prediction accuracy
-Run the following script:
-```
-./fig10.sh
+| 参数 | 必需 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--workload` | ✅ | - | 工作负载名称 (bert, resnet50, etc.) |
+| `--arch_name` | ❌ | gemmini | 目标架构名称 |
+| `--dataset_path` | ✅ | - | 数据集文件路径 |
+| `--predictor` | ❌ | analytical | 预测器类型 (analytical/dnn/both) |
+| `--output_dir` | ❌ | output_dir | 结果输出目录 |
+| `--plot_only` | ❌ | False | 只生成图表，不运行搜索 |
+| `--ordering` | ❌ | shuffle | 搜索顺序 (shuffle/sequential/random) |
+| `--use_cpu` | ❌ | False | 强制使用CPU模式 |
+
+## 💻 高级编程接口
+
+### 使用SearchEngine类
+
+```python
+from dataset.dse.core import SearchEngine
+import pathlib
+
+# 创建搜索引擎
+with SearchEngine(
+    arch_name="gemmini",
+    output_dir=pathlib.Path("./my_results"), 
+    workload="bert",
+    gpu_id=None,  # None表示CPU模式
+    log_times=True
+) as engine:
+    
+    # 运行贝叶斯优化搜索
+    results = engine.search(
+        strategy="bayesian", 
+        n_calls=100,
+        n_initial_points=10
+    )
+    
+    # 运行梯度下降搜索
+    gd_results = engine.search(
+        strategy="gradient_descent",
+        n_calls=50
+    )
+    
+    # 运行随机搜索
+    random_results = engine.search(
+        strategy="random",
+        n_calls=200
+    )
+    
+    # 获取搜索摘要
+    summary = engine.get_search_summary()
+    print(f"搜索了 {summary['num_layers']} 个层")
+    print(f"可用策略: {summary['available_strategies']}")
 ```
 
-This will reproduce the plots in Figures 10 and 11 under "output_dir/predict_<predictor>_<dataset>.png". These plots show the prediction accuracy of the three different predictors on the two datasets of Gemmini-RTL latency, which were previously generated using FireSim.
+### 使用工具函数
 
-## FireSim-Based Experiments
-First, follow the instructions on the [FireSim website](https://docs.fires.im/en/1.20.1/Getting-Started-Guides/AWS-EC2-F1-Getting-Started/) to create an EC2 manager instance. Complete the steps in the “AWS EC2 F1 Getting Started Guide”. Once you have completed up to and including "Setting up your Manager Instance / Key setup, Part 2" in the FireSim docs, you should have a manager instance set up, with an IP address and key. Use ssh or mosh to log in to the instance. 
+```python
+from dataset.common.utils import FileHandler, MathUtils, ProcessManager
 
-Next, in "/home/centos", clone the archived FireSim repository.
-```
-git clone https://github.com/charleshong3/firesim-dosa.git
+# 文件操作
+config = FileHandler.load_yaml("config.yaml")
+results = FileHandler.load_json("results.json")
+FileHandler.save_csv(data, "output.csv")
+
+# 数学计算
+factors = MathUtils.get_prime_factors(128)
+correlation = MathUtils.get_correlation(data1, data2)
+
+# 进程管理
+result = ProcessManager.run_command("timeloop-mapper", timeout=300)
 ```
 
-Run the following, which will initialize dependencies and set up FireSim and Chipyard:
+### 直接调用搜索函数
+
+```python
+from dataset.dse import mapping_driven_hw_search
+
+results = mapping_driven_hw_search.search_network(
+    arch_name="gemmini",
+    output_dir="./results",
+    workload="bert", 
+    dataset_path="./data/timeloop_dataset/dataset.csv",
+    predictor="analytical",
+    plot_only=False,
+    ordering="shuffle"
+)
+
+print(f"搜索状态: {results.get('status', 'unknown')}")
+print(f"设备信息: {results.get('device_info', {})}")
 ```
-cd firesim-dosa
-./build-setup.sh
-sudo yum install autoconf
-source sourceme-f1-manager.sh
-firesim managerinit --platform f1
+
+## 🔧 常见工作负载
+
+### 支持的工作负载
+- `bert`: BERT语言模型
+- `resnet50`: ResNet-50图像分类
+- `mobilenet`: MobileNet轻量级网络
+- `transformer`: Transformer模型
+
+### 支持的架构
+- `gemmini`: Gemmini加速器架构
+- 其他架构可通过配置文件添加
+
+## 📊 结果分析
+
+### 输出文件结构
 ```
-> If encountering errors with mirror.centos.org, run below code before re-executing ./build-setup.sh.
+output_dir/
+├── search_results_*.json    # 搜索结果
+├── performance_logs/        # 性能日志
+├── visualizations/          # 生成的图表
+└── configs/                 # 使用的配置文件
+```
+
+### 结果解读
+- **cycle**: 执行周期数
+- **energy**: 能耗估算
+- **area**: 硬件面积
+- **efficiency**: 效率评分
+
+## 🚨 常见问题解决
+
+### CUDA兼容性问题
+如果遇到CUDA错误，框架会自动回退到CPU模式：
+```bash
+# 手动强制CPU模式
+python dosa_search.py --use_cpu [其他参数]
+```
+
+### 内存不足
+```bash
+# 减少搜索调用次数
+python -c "
+from dataset.dse.core import SearchEngine
+engine = SearchEngine(...)
+results = engine.search('bayesian', n_calls=50)  # 减少到50次
+"
+```
+
+### 找不到工作负载
+确保工作负载目录存在：
+```bash
+ls dataset/workloads/bert/  # 检查bert工作负载
+ls dataset/workloads/       # 查看所有可用工作负载
+```
+
+## 🛠️ 扩展和定制
+
+### 添加新的搜索策略
+```python
+from dataset.dse.core.search_strategies import BaseSearchStrategy
+
+class MyCustomStrategy(BaseSearchStrategy):
+    def search(self, n_calls=100, **kwargs):
+        # 实现自定义搜索逻辑
+        pass
+```
+
+### 添加新的预测器
+```python
+from dataset.dse.core.models import BasePredictor
+
+class MyPredictor(BasePredictor):
+    def predict(self, features):
+        # 实现自定义预测逻辑
+        pass
+```
+
+## 📈 性能优化建议
+
+1. **使用CPU模式**: 除非确定GPU兼容，建议使用`--use_cpu`
+2. **调整搜索次数**: 根据资源情况调整`n_calls`参数
+3. **并行处理**: 框架内置并行优化，无需额外配置
+4. **缓存结果**: 重复实验会自动使用缓存结果
+
+## 🎯 最佳实践
+
+1. **开始实验前先测试**:
+   ```bash
+   python dosa_test.py  # 运行框架测试
+   ```
+
+2. **使用合适的预测器**:
+   - `analytical`: 快速，适合初步探索
+   - `dnn`: 精确，适合最终优化
+   - `both`: 综合，适合全面分析
+
+3. **保存重要结果**:
+   ```bash
+   python dosa_search.py --output_dir ./important_results [其他参数]
+   ```
+
+4. **监控资源使用**:
+   ```bash
+   htop  # 监控CPU和内存使用
+   ```
+
+---
+
+## 🎉 开始使用
+
+现在你可以开始使用DOSA进行深度学习加速器设计了！从简单的命令开始：
 
 ```bash
-sudo sed -i s/mirror.centos.org/vault.centos.org/g /etc/yum.repos.d/*.repo
-sudo sed -i s/^#.*baseurl=http/baseurl=http/g /etc/yum.repos.d/*.repo
-sudo sed -i s/^mirrorlist=http/#mirrorlist=http/g /etc/yum.repos.d/*.repo
+conda activate dosa
+python dosa_search.py --workload bert --dataset_path ./data/timeloop_dataset/dataset.csv --use_cpu
 ```
 
-After sourcing, complete the steps in "Setting up your Manager Instance / Completing Setup Using the Manager".
-
-**Note that sourceme-f1-manager.sh must be sourced every time you log in to the instance.**
-
-Finally, get the FPGA image used for this experiment. Go to "firesim-dosa/deploy", and paste into `config_hwdb.yaml` the contents of the file in "built-hwdb-entries/" (there should be one file containing a YAML-formatted entry).
-
-### Figure 12: Optimization of Gemmini-RTL
-Now, **move to the AWS EC2 instance** set up with the FireSim fork. To run the full workflow of Figure 12, we would need to train two DNN models, run DOSA (constraining the number of PEs to 16x16), select the mappings with the best predicted performance, evaluate latency with FireSim, then combine with energy numbers from Accelergy. To reduce runtime and work that must be done across both the user machine and EC2 instance, we provide the mappings generated by DOSA during this experiment directly to the evaluator as part of our FireSim fork. To build the software for a given workload and run FireSim, run the following:
-```
-cd ~/firesim/target-design/chipyard/generators/gemmini/software/gemmini-rocc-tests
-./artifact_script.sh (analytical|both|dnn) (unet|resnet50|bert|retinanet)
-```
-The first argument to `artifact_script.sh` indicates which of the three latency predictors from the previous section should be used. The second argument indicates the target workload. This script launches FireSim automatically and should take a few minutes to run. Depending on the target workload, FireSim will generate either one or two directories under "deploy/results-workload", for matrix multiplication and/or convolutional layers. Pass the previously selected options, along with the directories (**($result_dir_1)** and potentially **($result_dir_2)**) to the parsing script.
-```
-cd ~/firesim/target-design/chipyard/generators/gemmini/software/gemmini-rocc-tests
-python parse_results.py
-  --pred (analytical|both|dnn)
-  --workload (unet|resnet50|bert|retinanet)
-  --result ($result_dir_1)
-  --result ($result_dir_2)
-```
-
-This will update the CSV file located at "gemmini-rocc-tests/ artifact/<predictor>/<workload>.csv". **Copy this file back to the user machine**, to your choice of path **($workload_csv)**. On the user machine, run the following to print out the EDP of the Gemmini default mapper/HW and the EDP of the mappings/HW found by DOSA, all using latency numbers from FireSim. The relative magnitude of the Gemmini default and DOSA EDPs should match those in Figure 12.
-```
-./fig12.sh (unet|resnet50|bert|retinanet) ($workload_csv)
-```
-
-When you are done evaluating, go to the EC2 console and terminate your instance(s).
+如有问题，检查日志输出或运行测试脚本 `python dosa_test.py`。 
