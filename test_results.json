@@ -1,0 +1,55 @@
+{
+  "Configuration Modules": {
+    "config": {
+      "status": "success",
+      "parser_created": true,
+      "config_created": true,
+      "config_arch": "gemmini"
+    }
+  },
+  "Core Modules": {
+    "core": {
+      "status": "success",
+      "csv_handler_created": true,
+      "file_path": "test.csv"
+    }
+  },
+  "Hardware Components": {
+    "hw_components": {
+      "status": "success",
+      "mapping_processor_created": true,
+      "result_parser_created": true
+    }
+  },
+  "Search Strategies": {
+    "search_strategies": {
+      "status": "success",
+      "base_strategy_methods": 7,
+      "random_strategy_created": true,
+      "random_strategy_type": "RandomSearchOptimizer"
+    }
+  },
+  "Analysis Modules": {
+    "analysis": {
+      "status": "success",
+      "mlp_predictor_created": true,
+      "input_size": 10,
+      "utils_available": true
+    }
+  },
+  "Model Modules": {
+    "models": {
+      "status": "success",
+      "energy_model_created": true,
+      "arch_param_size": 5,
+      "output_dir": "test_output"
+    }
+  },
+  "Common Utilities": {
+    "common_utils": {
+      "status": "success",
+      "random_seed": 42,
+      "mapping_utils_available": true
+    }
+  }
+}

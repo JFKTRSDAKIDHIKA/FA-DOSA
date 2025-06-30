@@ -30,7 +30,7 @@ def build_mlp(
         input_size: int,
         output_size: int,
         n_layers: int,
-        size: int | tuple,
+        size: Union[int, tuple],
         activation: Activation = 'tanh',
         output_activation: Activation = 'identity',
         dropout=0.2,

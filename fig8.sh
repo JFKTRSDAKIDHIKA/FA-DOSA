@@ -1,2 +1,2 @@
 #!/bin/bash
-python dataset/dse/arch_baseline.py --workload $1
+python -m dataset.dse.arch_baseline --workload $1

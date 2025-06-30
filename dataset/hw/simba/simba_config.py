@@ -2,7 +2,7 @@ import pathlib
 import re
 import copy
 import random
-from collections.abc import Iterable
+from typing import List, Iterable
 
 from dataset.common import utils, logger
 from dataset.hw import HardwareConfig
@@ -22,7 +22,7 @@ class SimbaConfig(HardwareConfig):
         "DRAM": "WIO",
     }
 
-    def gen_random_hw_config(self) -> list[int]:
+    def gen_random_hw_config(self) -> List[int]:
         """
         mac_num is number of MACs per vector unit (8 vector units per PE)
         """
@@ -184,7 +184,7 @@ class SimbaConfig(HardwareConfig):
 
         return arch_dict
 
-    def parse_arch_yaml(self, arch_path: pathlib.Path) -> list:
+    def parse_arch_yaml(self, arch_path: pathlib.Path) -> dict:
         """
         Not tested. TODO implement/debug.
         """

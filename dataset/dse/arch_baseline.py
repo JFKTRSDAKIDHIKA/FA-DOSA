@@ -4,6 +4,7 @@ import re
 import subprocess
 import time
 import argparse
+from typing import List
 
 import matplotlib.pyplot as plt
 
@@ -28,7 +29,7 @@ def run_timeloop(paths, cwd=os.getcwd(), stdout=None, stderr=None, run_async=Fal
         logger.error("Failed to run timeloop-mapper with exception %s", e)
         return False
 
-def get_layer_count(workload_path, layers) -> list[int]:
+def get_layer_count(workload_path, layers) -> List[int]:
     try:
         layer_count_dict = utils.parse_yaml(workload_path / 'layer_count.yaml')
         counts = [layer_count_dict[prob.config_str()]["count"] for prob in layers]
@@ -37,7 +38,7 @@ def get_layer_count(workload_path, layers) -> list[int]:
         counts = [1 for prob in layers]
     return counts
 
-def parse_random_output(output_log_file: pathlib.Path, layer_prob: Prob) -> list[dict]:
+def parse_random_output(output_log_file: pathlib.Path, layer_prob: Prob) -> List[Dict]:
     """
     Parses stdout of Timeloop that spits out all randomly searched schedules
 

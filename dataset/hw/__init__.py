@@ -1,6 +1,6 @@
 # __init__.py
 from dataset.common import logger
-from .hardware_config import HardwareConfig
+from .hardware_config_refactored import HardwareConfigBase as HardwareConfig
 from .gemmini.gemmini_config import GemminiConfig
 from .simba.simba_config import SimbaConfig
 

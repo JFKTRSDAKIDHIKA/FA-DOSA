@@ -2,6 +2,7 @@ import pathlib
 import traceback
 import math
 import random
+from typing import List
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -175,7 +176,7 @@ def sw_optimize(prob: Prob, hardware_arc: HardwareConfig, train_size: int, train
     best_n_mapping = test_mappings[preds[np.argmin(best_n)]]
     return best_n_mapping
 
-def layers_optimize(probs: list[Prob], layers_counts: list[int], hardware_arc: HardwareConfig, sw_train_size: int, sw_trail_size: int=10, sw_batch_size: int=10000, output_dir: pathlib.Path = DATASET_ROOT_PATH/'dse'/'output'):
+def layers_optimize(probs: List[Prob], layers_counts: List[int], hardware_arc: HardwareConfig, sw_train_size: int, sw_trail_size: int=10, sw_batch_size: int=10000, output_dir: pathlib.Path = DATASET_ROOT_PATH/'dse'/'output'):
     energy_sum = 0
     cycles_sum = 0
     for prob, layer_count in zip(probs, layers_counts):
@@ -185,7 +186,7 @@ def layers_optimize(probs: list[Prob], layers_counts: list[int], hardware_arc: H
     return energy_sum * cycles_sum
 
 
-def hw_optimize(prob: list[Prob], layer_counts: list[int], hw_train_size: int, sw_train_size: int, hw_trail_size:int, sw_trail_size:int, sw_test_size:int, output_dir: pathlib.Path = DATASET_ROOT_PATH/'dse'/'output'):
+def hw_optimize(prob: List[Prob], layer_counts: List[int], hw_train_size: int, sw_train_size: int, hw_trail_size:int, sw_trail_size:int, sw_test_size:int, output_dir: pathlib.Path = DATASET_ROOT_PATH/'dse'/'output'):
     # Generate all possible mappings
     train_hardware_configs = random_hardware_config(hw_train_size, output_dir)
     train_y = []
