@@ -169,20 +169,23 @@ class SearchEngine:
                 arch_name=self.arch_name,
                 output_dir=self.output_dir,
                 layers=self.layers,
-                mapping_evaluator=self.mapping_evaluator
+                mapping_evaluator=self.mapping_evaluator,
+                workload_name=self.workload_name
             ),
             'gradient_descent': GradientDescentOptimizer(
                 arch_name=self.arch_name,
                 output_dir=self.output_dir,
                 layers=self.layers,
                 mapping_evaluator=self.mapping_evaluator,
-                performance_tracker=self.performance_tracker
+                performance_tracker=self.performance_tracker,
+                workload_name=self.workload_name
             ),
             'random': RandomSearchOptimizer(
                 arch_name=self.arch_name,
                 output_dir=self.output_dir,
                 layers=self.layers,
-                mapping_evaluator=self.mapping_evaluator
+                mapping_evaluator=self.mapping_evaluator,
+                workload_name=self.workload_name
             )
         }
         

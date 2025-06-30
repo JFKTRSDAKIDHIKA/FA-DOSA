@@ -7,11 +7,34 @@ import pickle
 import pathlib
 import tarfile
 import os
-from typing import Any, Dict, List, Union
-
 import yaml
+import zipfile
+from typing import Any, Dict, List, Union
+import numpy as np
 
 from ..logger import logger
+
+
+class CustomJSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder to handle NumPy arrays and other non-serializable objects."""
+    
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, pathlib.Path):
+            return str(obj)
+        elif hasattr(obj, '__dict__'):
+            # For custom objects, try to serialize their dict representation
+            return obj.__dict__
+        else:
+            # For other unserializable objects, convert to string
+            return str(obj)
 
 
 class FileHandler:
@@ -102,7 +125,7 @@ class FileHandler:
     def save_json(json_path: Union[str, pathlib.Path], data: Any, 
                   indent: int = 2, ensure_ascii: bool = False) -> None:
         """
-        Save data to JSON file with error handling.
+        Save data to JSON file with error handling and custom encoder for NumPy arrays.
         
         Args:
             json_path: Path to output JSON file
@@ -115,7 +138,7 @@ class FileHandler:
             json_path.parent.mkdir(parents=True, exist_ok=True)
             
             with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=indent, ensure_ascii=ensure_ascii)
+                json.dump(data, f, cls=CustomJSONEncoder, indent=indent, ensure_ascii=ensure_ascii)
             
             logger.debug(f"Saved JSON: {json_path}")
             

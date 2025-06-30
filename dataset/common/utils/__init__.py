@@ -27,6 +27,11 @@ load_pickle = FileHandler.load_pickle
 save_pickle = FileHandler.save_pickle
 make_tarfile = FileHandler.create_tarfile
 
+# Add store_yaml for backward compatibility
+def store_yaml(yaml_path, data):
+    """Store data as YAML file (backward compatibility function)."""
+    return FileHandler.save_yaml(yaml_path, data)
+
 # Math operations
 set_random_seed = RandomUtils.set_global_seed
 get_random_seed = RandomUtils.get_current_seed
@@ -77,7 +82,7 @@ __all__ = [
     'logger',
     
     # Backward compatibility functions
-    'parse_yaml', 'parse_json', 'save_yaml', 'save_json',
+    'parse_yaml', 'parse_json', 'save_yaml', 'save_json', 'store_yaml',
     'load_pickle', 'save_pickle', 'make_tarfile',
     'set_random_seed', 'get_random_seed', 'get_prime_factors', 
     'get_divisors', 'calculate_correlation',
