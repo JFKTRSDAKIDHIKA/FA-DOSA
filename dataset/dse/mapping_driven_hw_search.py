@@ -56,6 +56,7 @@ def search_network(arch_name: str,
                    workload: str,
                    dataset_path: str,
                    predictor: str = "analytical",
+                   search_strategy: str = "auto",
                    plot_only: bool = False,
                    ordering: str = "shuffle") -> Dict[str, Any]:
     """
@@ -67,6 +68,7 @@ def search_network(arch_name: str,
         workload: Workload name to search
         dataset_path: Path to dataset file
         predictor: Predictor type ('analytical', 'dnn', 'both')
+        search_strategy: Search strategy ('auto', 'bayesian', 'gradient_descent', 'random')
         plot_only: Whether to only generate plots
         ordering: Layer ordering strategy
         
@@ -78,6 +80,7 @@ def search_network(arch_name: str,
     logger.info(f"  Workload: {workload}")
     logger.info(f"  Dataset: {dataset_path}")
     logger.info(f"  Predictor: {predictor}")
+    logger.info(f"  Search Strategy: {search_strategy}")
     logger.info(f"  Output: {output_dir}")
     
     # Convert output_dir to Path
@@ -117,6 +120,7 @@ def search_network(arch_name: str,
         results = search_engine.search_network(
             dataset_path=dataset_path,
             predictor=predictor,
+            search_strategy=search_strategy,
             plot_only=plot_only,
             ordering=ordering
         )

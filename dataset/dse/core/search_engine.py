@@ -258,6 +258,7 @@ class SearchEngine:
     def search_network(self,
                       dataset_path: str,
                       predictor: str = "analytical",
+                      search_strategy: str = "auto",
                       plot_only: bool = False,
                       ordering: str = "shuffle") -> Dict[str, Any]:
         """
@@ -266,13 +267,14 @@ class SearchEngine:
         Args:
             dataset_path: Path to dataset
             predictor: Predictor type ('analytical', 'learned')
+            search_strategy: Search strategy ('auto', 'bayesian', 'gradient_descent', 'random')
             plot_only: Whether to only generate plots
             ordering: Layer ordering strategy
             
         Returns:
             Network search results
         """
-        logger.info(f"Starting network search: dataset={dataset_path}, predictor={predictor}")
+        logger.info(f"Starting network search: dataset={dataset_path}, predictor={predictor}, strategy={search_strategy}")
         
         if plot_only:
             logger.info("Plot-only mode: generating visualizations from existing data")
@@ -282,21 +284,37 @@ class SearchEngine:
         results = {}
         
         try:
+            # Determine search strategy based on input
+            if search_strategy == "auto":
+                # Auto-select based on predictor
+                if predictor in ['analytical', 'both']:
+                    strategy_for_analytical = "gradient_descent"
+                else:
+                    strategy_for_analytical = "bayesian"
+                    
+                if predictor in ['dnn', 'both']:
+                    strategy_for_dnn = "bayesian"
+                else:
+                    strategy_for_dnn = "gradient_descent"
+            else:
+                # Use specified strategy for both
+                strategy_for_analytical = search_strategy
+                strategy_for_dnn = search_strategy
+            
             # Run different search strategies based on predictor type
             if predictor in ['analytical', 'both']:
-                logger.info("Running analytical search...")
-                # Use gradient descent for analytical predictor to leverage differentiable models
+                logger.info(f"Running analytical search with {strategy_for_analytical} strategy...")
                 analytical_results = self.search(
-                    strategy="gradient_descent",  # Use gradient descent for analytical models
+                    strategy=strategy_for_analytical,
                     n_calls=20,  # Reasonable number for quick results
                     n_initial_points=5
                 )
                 results['analytical'] = analytical_results
                 
             if predictor in ['dnn', 'both']:
-                logger.info("Running DNN-based search...")
+                logger.info(f"Running DNN-based search with {strategy_for_dnn} strategy...")
                 dnn_results = self.search(
-                    strategy="bayesian",  # Use bayesian for DNN predictor
+                    strategy=strategy_for_dnn,
                     n_calls=15,
                     n_initial_points=3
                 )

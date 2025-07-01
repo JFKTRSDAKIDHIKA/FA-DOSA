@@ -27,6 +27,7 @@ class SearchConfig:
     workload: str
     arch_name: str = 'gemmini'
     predictor: str = 'analytical'
+    search_strategy: str = 'auto'  # 'auto', 'bayesian', 'gradient_descent', 'random'
     plot_only: bool = False
     ordering: str = 'shuffle'
     use_cpu: bool = False
@@ -42,6 +43,12 @@ class SearchConfig:
         if self.predictor not in valid_predictors:
             raise ValueError(f"Predictor '{self.predictor}' not supported. "
                            f"Valid options: {valid_predictors}")
+        
+        # Validate search strategy
+        valid_strategies = ['auto', 'bayesian', 'gradient_descent', 'random']
+        if self.search_strategy not in valid_strategies:
+            raise ValueError(f"Search strategy '{self.search_strategy}' not supported. "
+                           f"Valid options: {valid_strategies}")
         
         # Validate dataset path
         if not pathlib.Path(self.dataset_path).is_file():
@@ -65,6 +72,7 @@ class SearchArgumentParser:
     
     VALID_PREDICTORS = ['analytical', 'dnn', 'both']
     VALID_ORDERINGS = ['shuffle', 'sequential', 'random']
+    VALID_STRATEGIES = ['auto', 'bayesian', 'gradient_descent', 'random']
     
     def __init__(self):
         self.parser = self._create_parser()
@@ -103,6 +111,14 @@ class SearchArgumentParser:
             choices=self.VALID_PREDICTORS,
             default='analytical',
             help='Type of performance predictor to use'
+        )
+        
+        parser.add_argument(
+            '--search_strategy',
+            type=str,
+            choices=self.VALID_STRATEGIES,
+            default='auto',
+            help='Search strategy to use (auto: automatically choose based on predictor)'
         )
         
         parser.add_argument(
@@ -150,6 +166,7 @@ def run_search_experiment(config: SearchConfig) -> None:
     logger.info(f"  Workload: {config.workload}")
     logger.info(f"  Dataset: {config.dataset_path}")
     logger.info(f"  Predictor: {config.predictor}")
+    logger.info(f"  Search Strategy: {config.search_strategy}")
     logger.info(f"  Output: {config.output_path}")
     logger.info(f"  Plot only: {config.plot_only}")
     logger.info(f"  Ordering: {config.ordering}")
@@ -169,6 +186,7 @@ def run_search_experiment(config: SearchConfig) -> None:
             workload=config.workload,
             dataset_path=config.dataset_path,
             predictor=config.predictor,
+            search_strategy=config.search_strategy,
             plot_only=config.plot_only,
             ordering=config.ordering
         )
@@ -203,6 +221,7 @@ def main(args: Optional[list] = None) -> int:
             workload=parsed_args.workload,
             arch_name=parsed_args.arch_name,
             predictor=parsed_args.predictor,
+            search_strategy=parsed_args.search_strategy,
             plot_only=parsed_args.plot_only,
             ordering=parsed_args.ordering,
             use_cpu=parsed_args.use_cpu
