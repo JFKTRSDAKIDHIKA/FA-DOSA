@@ -25,7 +25,7 @@ costs:
 # Loss function weights
 weights:
   penalty_weight: 1.0       # Weight for tiling factor < 1 penalty
-  product_penalty_weight: 10.0  # Weight for product constraint penalty
+  product_penalty_weight: 500.0  # Weight for product constraint penalty
 
 # Problem dimensions
 dimensions:
