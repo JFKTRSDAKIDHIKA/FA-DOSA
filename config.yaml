@@ -1,0 +1,32 @@
+# Hardware configuration
+hardware:
+  # Memory system
+  dram_bandwidth_gb_s: 100.0
+  sram_bandwidth_gb_s: 1000.0
+  mac_throughput_gops: 1000.0
+  bytes_per_element: 4  # float32
+
+  # Memory hierarchy
+  num_memory_levels: 3  # 0: Registers, 1: Accumulator, 2: Scratchpad
+
+# Cost model parameters
+costs:
+  # Energy costs (pJ/byte)
+  dram_access_cost_pj_byte: 2.5  # 10.0 / 4 bytes
+  sram_base_cost_pj_byte: 0.25   # 1.0 / 4 bytes
+  fusion_overhead_cost_pj: 0.5
+  
+  # Area costs
+  area_coefficient_mm2_per_kb: 0.0001  # Area per unit of buffer size
+  
+  # Energy scaling
+  sram_energy_scaling_pj_byte_kb: 0.0001  # Energy increase per KB of buffer size
+
+# Loss function weights
+weights:
+  penalty_weight: 1.0       # Weight for tiling factor < 1 penalty
+  product_penalty_weight: 10.0  # Weight for product constraint penalty
+
+# Problem dimensions
+dimensions:
+  loop_dims: ['R', 'S', 'P', 'Q', 'C', 'K', 'N']  # Loop dimensions from DOSA paper 
