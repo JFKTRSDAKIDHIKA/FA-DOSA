@@ -309,6 +309,38 @@ class ComputationGraph:
         """
         return '__'.join(sorted(group))
     
+    def get_node_producers(self, node_name: str) -> List[str]:
+        """
+        Get the names of all parent (producer) nodes for a given node.
+        
+        Args:
+            node_name: Name of the target node
+            
+        Returns:
+            List of producer node names
+        """
+        producers = []
+        for src, dest in self.edges:
+            if dest == node_name:
+                producers.append(src)
+        return producers
+    
+    def get_node_consumers(self, node_name: str) -> List[str]:
+        """
+        Get the names of all child (consumer) nodes for a given node.
+        
+        Args:
+            node_name: Name of the target node
+            
+        Returns:
+            List of consumer node names
+        """
+        consumers = []
+        for src, dest in self.edges:
+            if src == node_name:
+                consumers.append(dest)
+        return consumers
+    
     def validate(self) -> None:
         """
         Validate graph structure.
@@ -497,7 +529,7 @@ class ConditionalPerformanceModel(nn.Module):
         mapping_params: MappingParameters,
         graph: ComputationGraph,
         hw_config: Dict[str, torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Calculate analytical latency and energy costs for a layer.
         Implements formulas from DOSA paper [3809, 3858].
@@ -510,7 +542,9 @@ class ConditionalPerformanceModel(nn.Module):
         
         Returns:
             latency: Computed latency based on roofline model
-            energy: Computed energy based on memory accesses
+            compute_energy: Energy for computation (MAC operations)
+            sram_energy: Energy for SRAM buffer accesses
+            dram_energy: Energy for DRAM accesses
         """
         config = Config.get_instance()
         layer_info = graph.layers[layer_name]
@@ -529,19 +563,22 @@ class ConditionalPerformanceModel(nn.Module):
         # Final latency is max of compute and memory bound
         latency = torch.maximum(compute_latency, memory_latency)
         
+        # Calculate compute energy (simple function of total MACs)
+        compute_energy = total_macs * torch.tensor(0.1, dtype=torch.float32)  # 0.1 pJ per MAC operation
+        
         # Calculate dynamic SRAM energy based on buffer size
         sram_energy_per_access = (
             torch.tensor(config.SRAM_BASE_COST, dtype=torch.float32) +
             hw_config['buffer_size'] * torch.tensor(config.SRAM_ENERGY_SCALING, dtype=torch.float32)
         )
         
-        # Calculate energy based on memory accesses with dynamic SRAM cost
-        energy = (
-            sum(access_counts.values()) * torch.tensor(config.DRAM_ACCESS_COST, dtype=torch.float32) +
-            sum(layer_mapping.calculate_buffer_requirements(layer_info['dims']).values()) * sram_energy_per_access
-        )
+        # Calculate SRAM energy based on buffer requirements
+        sram_energy = sum(layer_mapping.calculate_buffer_requirements(layer_info['dims']).values()) * sram_energy_per_access
         
-        return latency, energy
+        # Calculate DRAM energy based on access counts
+        dram_energy = sum(access_counts.values()) * torch.tensor(config.DRAM_ACCESS_COST, dtype=torch.float32)
+        
+        return latency, compute_energy, sram_energy, dram_energy
 
     def forward(
         self,
@@ -551,7 +588,8 @@ class ConditionalPerformanceModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Calculate latency, energy, and area costs using analytical models.
-        Uses differentiable weighted-average for fusion decisions.
+        Uses differentiable weighted-average for fusion decisions with physically accurate
+        DRAM energy savings modeling.
         
         Args:
             mapping_params: MappingParameters object containing layer mappings
@@ -563,6 +601,8 @@ class ConditionalPerformanceModel(nn.Module):
             total_energy: Total energy consumption across all layers
             area_cost: Hardware cost based on buffer requirements
         """
+        config = Config.get_instance()
+        
         # Calculate minimal hardware configuration
         hw_config = calculate_hardware_config(mapping_params, graph)
         
@@ -581,41 +621,90 @@ class ConditionalPerformanceModel(nn.Module):
         for layer_name in graph.get_layer_names():
             if layer_name not in layers_in_fusion_groups:
                 # Calculate analytical costs for standalone layer
-                latency, energy = self._calculate_analytical_costs(
+                latency, compute_energy, sram_energy, dram_energy = self._calculate_analytical_costs(
                     layer_name, mapping_params, graph, hw_config
                 )
                 total_latency = total_latency + latency
-                total_energy = total_energy + energy
+                total_energy = total_energy + compute_energy + sram_energy + dram_energy
         
-        # Handle fusion groups using differentiable weighted-average
+        # Handle fusion groups using differentiable weighted-average with EDP calculation
         for group in graph.fusion_groups:
             # Get fusion probability for this group
             p_fuse = fusion_params.get_fusion_probability(group)
             
-            # Calculate fused costs
-            fused_latency = torch.tensor(0.0)
-            fused_energy = torch.tensor(0.0)
-            for layer_name in group:
-                lat, eng = self._calculate_analytical_costs(
-                    layer_name, mapping_params, graph, hw_config
-                )
-                fused_latency = torch.maximum(fused_latency, lat)
-                fused_energy = fused_energy + eng
-            
-            # Add fusion overhead to energy
-            fused_energy = fused_energy + torch.tensor(Config.get_instance().FUSION_OVERHEAD_COST, dtype=torch.float32)
-            
-            # Calculate non-fused costs
+            # === Calculate Non-Fused Costs (cost_no_fuse) ===
             non_fused_latency = torch.tensor(0.0)
             non_fused_energy = torch.tensor(0.0)
+            
             for layer_name in group:
-                lat, eng = self._calculate_analytical_costs(
+                lat, compute_energy, sram_energy, dram_energy = self._calculate_analytical_costs(
                     layer_name, mapping_params, graph, hw_config
                 )
                 non_fused_latency = non_fused_latency + lat
-                non_fused_energy = non_fused_energy + eng
+                non_fused_energy = non_fused_energy + compute_energy + sram_energy + dram_energy
             
-            # Calculate weighted-average costs for this group
+            # Energy-Delay Product for non-fused case
+            cost_no_fuse = non_fused_latency * non_fused_energy
+            
+            # === Calculate Fused Costs (cost_fused) ===
+            fused_latency = torch.tensor(0.0)
+            fused_compute_energy = torch.tensor(0.0)
+            fused_sram_energy = torch.tensor(0.0)
+            fused_dram_energy = torch.tensor(0.0)
+            
+            for layer_name in group:
+                lat, compute_energy, sram_energy, dram_energy = self._calculate_analytical_costs(
+                    layer_name, mapping_params, graph, hw_config
+                )
+                # Latency is dominated by the slowest path (parallel execution)
+                fused_latency = torch.maximum(fused_latency, lat)
+                fused_compute_energy = fused_compute_energy + compute_energy
+                fused_sram_energy = fused_sram_energy + sram_energy
+                fused_dram_energy = fused_dram_energy + dram_energy
+            
+            # === MODEL THE DRAM SAVING ===
+            # For fusion groups, intermediate tensors avoid DRAM write + read
+            if len(group) >= 2:
+                # Calculate intermediate tensor size from first layer's output
+                first_layer = group[0]
+                first_layer_dims = graph.layers[first_layer]['dims']
+                
+                # Simplified proxy for output tensor size (elements * bytes_per_element)
+                # Output size = N * K * P * Q for conv layers
+                if 'P' in first_layer_dims and 'Q' in first_layer_dims:
+                    intermediate_tensor_size = torch.tensor(
+                        first_layer_dims['N'] * first_layer_dims.get('K', first_layer_dims.get('C', 1)) * 
+                        first_layer_dims['P'] * first_layer_dims['Q'] * config.BYTES_PER_ELEMENT,
+                        dtype=torch.float32
+                    )
+                else:
+                    # For other layer types, use a simpler calculation
+                    intermediate_tensor_size = torch.tensor(
+                        first_layer_dims['N'] * first_layer_dims.get('K', first_layer_dims.get('C', 1)) * config.BYTES_PER_ELEMENT,
+                        dtype=torch.float32
+                    )
+                
+                # DRAM energy saved = 2 * intermediate_tensor_size * DRAM_ACCESS_COST
+                # (one write to DRAM avoided, one read from DRAM avoided)
+                dram_energy_saved = 2 * intermediate_tensor_size * torch.tensor(config.DRAM_ACCESS_COST, dtype=torch.float32)
+                
+                # Subtract the saving from fused DRAM energy
+                fused_dram_energy = fused_dram_energy - dram_energy_saved
+                
+                # Ensure DRAM energy doesn't go negative
+                fused_dram_energy = torch.maximum(fused_dram_energy, torch.tensor(0.0))
+            
+            # Calculate final fused energy with fusion overhead
+            fused_energy = fused_compute_energy + fused_sram_energy + fused_dram_energy + torch.tensor(config.FUSION_OVERHEAD_COST, dtype=torch.float32)
+            
+            # Energy-Delay Product for fused case
+            cost_fused = fused_latency * fused_energy
+            
+            # === Calculate Weighted-Average EDP for the group ===
+            group_edp = p_fuse * cost_fused + (1 - p_fuse) * cost_no_fuse
+            
+            # Convert back to latency and energy for accumulation
+            # For differentiable accumulation, we use the weighted averages
             group_latency = p_fuse * fused_latency + (1 - p_fuse) * non_fused_latency
             group_energy = p_fuse * fused_energy + (1 - p_fuse) * non_fused_energy
             

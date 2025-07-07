@@ -38,27 +38,34 @@ def run_fadose_experiment(graph: ComputationGraph, config: Config) -> dict:
     optimizer = optim.Adam([
         {'params': mapping_params.parameters()},
         {'params': fusion_params.parameters()}
-    ], lr=0.001)
+    ], lr=1e-5)
     
     # Training loop
-    num_epochs = 200
+    num_epochs = 1000
     
     for epoch in range(num_epochs):
         optimizer.zero_grad()
         
         latency, energy, area_cost = model(mapping_params, fusion_params, graph)
-        edp = latency * energy
         penalty = calculate_penalty_loss(mapping_params)
         product_penalty = calculate_product_constraint_penalty(mapping_params, graph)
         
-        total_cost = (
-            edp +
-            area_cost * edp +
-            config.PENALTY_WEIGHT * penalty * edp +
-            config.PRODUCT_PENALTY_WEIGHT * product_penalty * edp
+        # Apply log transformation to stabilize optimization
+        # Add small epsilon to prevent log(0)
+        log_latency = torch.log(latency + 1e-9)
+        log_energy = torch.log(energy + 1e-9)
+        log_area = torch.log(area_cost + 1e-9)
+        
+        # New loss as weighted sum of logs (converts multiplicative to additive)
+        # This replaces: total_cost = (latency * energy) * area_cost + penalties
+        # With: total_loss = log(latency) + log(energy) + log(area) + penalties
+        total_loss = (
+            log_latency + log_energy + log_area + 
+            config.PENALTY_WEIGHT * penalty + 
+            config.PRODUCT_PENALTY_WEIGHT * product_penalty
         )
         
-        total_cost.backward()
+        total_loss.backward()
         optimizer.step()
 
     # Final evaluation
@@ -66,15 +73,19 @@ def run_fadose_experiment(graph: ComputationGraph, config: Config) -> dict:
     final_edp = final_latency * final_energy
     final_penalty = calculate_penalty_loss(mapping_params)
     final_product_penalty = calculate_product_constraint_penalty(mapping_params, graph)
-    final_total_cost = (
-        final_edp + 
-        final_area * final_edp + 
-        config.PENALTY_WEIGHT * final_penalty * final_edp + 
-        config.PRODUCT_PENALTY_WEIGHT * final_product_penalty * final_edp
+    
+    # Calculate final loss in log domain (matching training loss)
+    log_final_latency = torch.log(final_latency + 1e-9)
+    log_final_energy = torch.log(final_energy + 1e-9)
+    log_final_area = torch.log(final_area + 1e-9)
+    final_total_loss = (
+        log_final_latency + log_final_energy + log_final_area + 
+        config.PENALTY_WEIGHT * final_penalty + 
+        config.PRODUCT_PENALTY_WEIGHT * final_product_penalty
     )
 
     return {
-        'final_loss': final_total_cost.item(),
+        'final_loss': final_total_loss.item(),
         'final_edp': final_edp.item(),
         'final_latency': final_latency.item(),
         'final_energy': final_energy.item(),
@@ -126,9 +137,9 @@ def run_twostep_baseline_experiment(graph: ComputationGraph, config: Config) -> 
         total_energy_nf = torch.tensor(0.0)
 
         for layer_name in graph.get_layer_names():
-            lat, eng = model._calculate_analytical_costs(layer_name, mapping_params, graph, hw_config_iter)
+            lat, comp_eng, sram_eng, dram_eng = model._calculate_analytical_costs(layer_name, mapping_params, graph, hw_config_iter)
             total_latency_nf += lat
-            total_energy_nf += eng
+            total_energy_nf += comp_eng + sram_eng + dram_eng
             
         edp_nf = total_latency_nf * total_energy_nf
         penalty = calculate_penalty_loss(mapping_params)
@@ -170,9 +181,9 @@ def run_twostep_baseline_experiment(graph: ComputationGraph, config: Config) -> 
         fused_latency = torch.tensor(0.0)
         fused_energy = torch.tensor(0.0)
         for layer_name in group:
-            lat, eng = model._calculate_analytical_costs(layer_name, mapping_params, graph, hw_config_decoupled)
+            lat, comp_eng, sram_eng, dram_eng = model._calculate_analytical_costs(layer_name, mapping_params, graph, hw_config_decoupled)
             fused_latency = torch.maximum(fused_latency, lat)
-            fused_energy += eng
+            fused_energy += comp_eng + sram_eng + dram_eng
         
         total_latency += fused_latency
         total_energy += fused_energy + torch.tensor(config.FUSION_OVERHEAD_COST)
@@ -181,9 +192,9 @@ def run_twostep_baseline_experiment(graph: ComputationGraph, config: Config) -> 
     # Calculate cost for standalone layers
     for layer_name in graph.get_layer_names():
         if layer_name not in processed_layers:
-            lat, eng = model._calculate_analytical_costs(layer_name, mapping_params, graph, hw_config_decoupled)
+            lat, comp_eng, sram_eng, dram_eng = model._calculate_analytical_costs(layer_name, mapping_params, graph, hw_config_decoupled)
             total_latency += lat
-            total_energy += eng
+            total_energy += comp_eng + sram_eng + dram_eng
             
     final_edp = total_latency * total_energy
     # Note: Penalties are not recalculated here, as they relate to the mapping, which is already fixed.
