@@ -106,7 +106,7 @@ def run_random_search_experiment(graph: ComputationGraph, config: Config) -> dic
     """
     print("Running Random Search...")
     
-    num_samples = 200  # Number of random configurations to try (reduced for testing)
+    num_samples = 1000  # Number of random configurations to try
     best_loss = float('inf')
     best_results = None
     
@@ -159,8 +159,8 @@ def run_random_search_experiment(graph: ComputationGraph, config: Config) -> dic
                     'final_area': area_cost.item(),
                 }
                 
-                if sample % 100 == 0:
-                    print(f"  Sample {sample}: Best loss so far = {best_loss:.4f}")
+            if sample % 200 == 0 and sample > 0:
+                print(f"  Sample {sample}/{num_samples}: Best loss so far = {best_loss:.4f}")
                     
         except Exception as e:
             # Skip invalid configurations
@@ -303,16 +303,17 @@ def main():
     config = Config.get_instance()
     
     # Experimental parameters
-    NUM_TRIALS = 2  # Number of independent trials for statistical significance
+    NUM_TRIALS = 5  # Number of independent trials for statistical significance
     
     # Define workloads and algorithms
     workloads = [
         'resnet18.onnx',
         'simple_cnn.onnx',
         'vgg_small.onnx',
-        # Enable additional models for comprehensive testing:
-        # 'mobilenet_v2.onnx',
-        # 'efficientnet_b0.onnx'
+        # Additional models for comprehensive testing:
+        'mobilenet_v2.onnx',
+        'efficientnet_b0.onnx',
+        # Note: Add bert_base.onnx, unet.onnx if available
     ]
     
     algorithms = {
@@ -395,7 +396,7 @@ def main():
         print(f"Results shape: {df.shape}")
         
         for workload in workloads:
-            if workload.replace('.onnx', '') in df['workload'].str.replace('.onnx', '').values:
+            if workload.replace('.onnx', '') in df['workload'].str.replace('.onnx', '', regex=False).values:
                 print(f"\n{workload}:")
                 workload_data = df[df['workload'] == workload]
                 summary = workload_data.groupby('algorithm')[['final_loss', 'final_edp', 'final_latency', 'final_energy', 'final_area']].agg(['mean', 'std', 'min', 'max'])
