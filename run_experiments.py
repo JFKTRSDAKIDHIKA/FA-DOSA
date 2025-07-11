@@ -36,10 +36,12 @@ from fa_dosa_demo import (
     FusionParameters,
     Config,
     ComputationGraph,  # <-- FIX: Import the correct graph class
-    # --- FIX: Add missing imports for penalty and setup functions ---
+    # --- UPDATED: Import new template-based constraint functions ---
     calculate_penalty_loss,
-    calculate_product_constraint_penalty,
-    calculate_hardware_constraint_penalty,
+    calculate_template_constraint_penalty,  # 新的模板约束函数
+    # 移除已废弃的约束函数：
+    # calculate_product_constraint_penalty,  # 已被 calculate_template_constraint_penalty 取代
+    # calculate_hardware_constraint_penalty,  # 已被 calculate_template_constraint_penalty 取代
     create_example_optimization_setup,
     create_joint_optimizer,
     calculate_total_loss_with_hardware_constraints,
@@ -166,24 +168,22 @@ def run_fadose_experiment(graph: ComputationGraph, config: Config, num_iteration
     final_latency, final_energy, final_area = model(mapping_params, fusion_params, hardware_params, graph)
     final_edp = final_latency * final_energy
     
-    # Calculate individual penalty components for reporting
+    # Calculate individual penalty components for reporting (updated for template-based constraints)
     final_penalty = calculate_penalty_loss(mapping_params)
-    final_product_penalty = calculate_product_constraint_penalty(mapping_params, graph)
-    final_hardware_penalty = calculate_hardware_constraint_penalty(mapping_params, hardware_params, graph)
+    final_template_constraint_penalty = calculate_template_constraint_penalty(mapping_params, hardware_params, graph)
     
     # Calculate final loss in log domain (matching training loss)
     log_final_latency = torch.log(final_latency + 1e-9)
     log_final_energy = torch.log(final_energy + 1e-9)
     log_final_area = torch.log(final_area + 1e-9)
 
-    # --- FIX: Use configurable weights for the loss function ---
+    # --- UPDATED: Use template-based constraint penalties ---
     # This allows us to guide the optimizer towards more desirable solutions.
     final_total_loss = (
         config.LATENCY_WEIGHT * log_final_latency + 
         config.ENERGY_WEIGHT * log_final_energy + 
         config.AREA_WEIGHT * log_final_area + 
-        config.PENALTY_WEIGHT * (final_penalty + final_hardware_penalty) + 
-        config.PRODUCT_PENALTY_WEIGHT * final_product_penalty
+        config.PENALTY_WEIGHT * (final_penalty + final_template_constraint_penalty)
     )
 
     print(f"    Final loss: {final_total_loss.item():.4f}")
@@ -362,12 +362,18 @@ def run_random_search_experiment(graph: ComputationGraph, config: Config, num_sa
             initial_buffer_size_kb=np.random.randint(64, 4097)
         )
         
-        # Randomize mapping parameters
+        # Randomize mapping parameters (template parameters)
         with torch.no_grad():
-            for sanitized_name, layer_mapping in mapping_params.mappings.items():
-                for dim, factor in layer_mapping.temporal_factors_L2.items():
-                    # Random factor between 0.1 and 10.0
-                    factor.fill_(torch.rand(1).item() * 9.9 + 0.1)
+            for group_key, decision_module in mapping_params.get_all_decision_modules().items():
+                # Randomize template selection logits
+                decision_module.template_selection_logits.uniform_(-3.0, 3.0)
+                
+                # Randomize template parameters for each template
+                for template_name, template in decision_module.templates.items():
+                    for param_name, param_tensor in template.named_parameters():
+                        if 'log_' in param_name:  # log-scale parameters
+                            # Random log-scale factors (corresponds to factors between ~0.1 and 10.0)
+                            param_tensor.uniform_(-2.3, 2.3)  # exp(-2.3) ≈ 0.1, exp(2.3) ≈ 10.0
         
         # Randomize fusion parameters
         with torch.no_grad():
@@ -379,20 +385,20 @@ def run_random_search_experiment(graph: ComputationGraph, config: Config, num_sa
             # Evaluate this configuration
             latency, energy, area_cost = model(mapping_params, fusion_params, hardware_params, graph)
             penalty = calculate_penalty_loss(mapping_params)
-            product_penalty = calculate_product_constraint_penalty(mapping_params, graph)
+            template_constraint_penalty = calculate_template_constraint_penalty(mapping_params, hardware_params, graph)
             
             # Calculate loss in log domain (matching FA-DOSA)
             log_latency = torch.log(latency + 1e-9)
             log_energy = torch.log(energy + 1e-9)
             log_area = torch.log(area_cost + 1e-9)
             
-            # --- FIX: Use configurable weights for the loss function ---
+            # --- UPDATED: Use template-based constraint penalties ---
             total_loss = (
                 config.LATENCY_WEIGHT * log_latency + 
                 config.ENERGY_WEIGHT * log_energy + 
                 config.AREA_WEIGHT * log_area + 
                 config.PENALTY_WEIGHT * penalty + 
-                config.PRODUCT_PENALTY_WEIGHT * product_penalty
+                config.PENALTY_WEIGHT * template_constraint_penalty
             )
             
             # Keep track of best configuration
@@ -507,14 +513,14 @@ def run_decoupled_sota_experiment(graph: ComputationGraph, config: Config) -> di
                     
                 edp_nf = total_latency_nf * total_energy_nf
                 penalty = calculate_penalty_loss(mapping_params)
-                product_penalty = calculate_product_constraint_penalty(mapping_params, graph)
+                template_constraint_penalty = calculate_template_constraint_penalty(mapping_params, mock_hardware_params, graph)
                 
                 # Loss function focused on EDP optimization
                 area_cost = mock_hardware_params.get_area_cost()
                 total_cost = (
                     edp_nf + area_cost * 0.001 +  # Small area weight
                     config.PENALTY_WEIGHT * penalty +
-                    config.PRODUCT_PENALTY_WEIGHT * product_penalty
+                    config.PENALTY_WEIGHT * template_constraint_penalty
                 )
                 
                 total_cost.backward()
@@ -547,15 +553,20 @@ def run_decoupled_sota_experiment(graph: ComputationGraph, config: Config) -> di
                 # Deep copy the best mapping parameters
                 best_hw_mapping_params = MappingParameters(graph)
                 with torch.no_grad():
-                    for (best_name, best_layer), (curr_name, curr_layer) in zip(
-                        best_hw_mapping_params.mappings.items(), 
-                        mapping_params.mappings.items()
-                    ):
-                        for (best_dim, best_factor), (curr_dim, curr_factor) in zip(
-                            best_layer.temporal_factors_L2.items(),
-                            curr_layer.temporal_factors_L2.items()
-                        ):
-                            best_factor.copy_(curr_factor)
+                    for group_key, curr_decision_module in mapping_params.get_all_decision_modules().items():
+                        best_decision_module = best_hw_mapping_params.get_all_decision_modules()[group_key]
+                        
+                        # Copy template selection logits
+                        best_decision_module.template_selection_logits.copy_(curr_decision_module.template_selection_logits)
+                        
+                        # Copy template parameters
+                        for template_name, curr_template in curr_decision_module.templates.items():
+                            best_template = best_decision_module.templates[template_name]
+                            for (best_param_name, best_param), (curr_param_name, curr_param) in zip(
+                                best_template.named_parameters(),
+                                curr_template.named_parameters()
+                            ):
+                                best_param.copy_(curr_param)
     
     print(f"  Step 1 Complete. Best HW: {best_hw_config['pe_count']} PEs, "
           f"{best_hw_config['buffer_size_kb']} KB buffer (EDP: {best_hw_config['edp']:.2e})")
@@ -696,14 +707,14 @@ def run_twostep_baseline_experiment(graph: ComputationGraph, config: Config) -> 
             
         edp_nf = total_latency_nf * total_energy_nf
         penalty = calculate_penalty_loss(mapping_params)
-        product_penalty = calculate_product_constraint_penalty(mapping_params, graph)
+        template_constraint_penalty = calculate_template_constraint_penalty(mapping_params, mock_hardware_params, graph)
         
         # Loss function for the non-fused case
         area_cost = mock_hardware_params.get_area_cost()
         total_cost = (
             edp_nf + area_cost * edp_nf +
             config.PENALTY_WEIGHT * penalty * edp_nf +
-            config.PRODUCT_PENALTY_WEIGHT * product_penalty * edp_nf
+            config.PENALTY_WEIGHT * template_constraint_penalty * edp_nf
         )
         
         total_cost.backward()
@@ -809,12 +820,26 @@ def save_learned_parameters(
         group_key = '__'.join(original_group)
         saved_data['fusion_params'][group_key] = torch.sigmoid(prob_tensor).item()
     
-    # Extract mapping parameters
-    for sanitized_name, layer_mapping in mapping_params.mappings.items():
-        original_name = mapping_params.layer_name_mapping[sanitized_name]
-        saved_data['mapping_params'][original_name] = {}
-        for dim, factor_tensor in layer_mapping.temporal_factors_L2.items():
-            saved_data['mapping_params'][original_name][dim] = factor_tensor.item()
+    # Extract mapping parameters (template-based)
+    for group_key, decision_module in mapping_params.get_all_decision_modules().items():
+        group_layers = mapping_params.group_mapping[group_key]
+        
+        # Save template selection probabilities
+        template_probs = decision_module.get_template_probabilities()
+        for i, template_name in enumerate(decision_module.template_names):
+            key = f"{group_key}_{template_name}_prob"
+            saved_data['mapping_params'][key] = template_probs[i].item()
+        
+        # Save selected template parameters
+        selected_template = decision_module.get_selected_template()
+        template_params = {}
+        for param_name, param_tensor in selected_template.named_parameters():
+            if 'log_' in param_name:
+                # Convert log-scale back to actual values
+                actual_value = torch.exp(param_tensor).item()
+                template_params[param_name.replace('log_', '')] = actual_value
+        
+        saved_data['mapping_params'][f"{group_key}_selected_params"] = template_params
     
     # Save to file
     torch.save(saved_data, filepath)

@@ -236,23 +236,132 @@ def find_nearest_divisor(n: int, target: float) -> int:
 
 def calculate_penalty_loss(mapping_params: 'MappingParameters') -> torch.Tensor:
     """
-    Calculate penalty term for invalid mapping parameters.
-    Penalizes tiling factors less than 1.0 as they are invalid in practice.
+    重构后的惩罚函数：适用于基于模板的参数结构。
+    
+    惩罚所有模板内部的 tiling 因子小于1的情况，因为这在物理上是不可能的。
+    现在需要遍历所有 MappingDecisionModule 中的所有模板实例。
     
     Args:
-        mapping_params: MappingParameters object containing all layer mappings
+        mapping_params: 映射策略管理器，包含所有决策模块
         
     Returns:
-        Total penalty summed across all invalid tiling factors
+        总惩罚值，累计所有无效的 tiling 因子
     """
-    total_penalty = torch.tensor(0.0)
+    total_penalty = torch.tensor(0.0, dtype=torch.float32)
     
-    # Iterate through all layers and their tiling factors
-    for sanitized_name, layer_mapping in mapping_params.mappings.items():
-        for factor in layer_mapping.temporal_factors_L2.values():
-            # Penalty is max(0, 1 - factor) to penalize factors < 1
-            penalty = torch.maximum(1 - factor, torch.tensor(0.0))
-            total_penalty = total_penalty + penalty
+    # 遍历所有决策模块
+    all_decision_modules = mapping_params.get_all_decision_modules()
+    
+    for group_key, decision_module in all_decision_modules.items():
+        # 遍历该决策模块中的所有模板实例
+        for template_name, template_instance in decision_module.templates.items():
+            # 检查该模板的所有 tiling 因子参数
+            if hasattr(template_instance, 'get_M0'):
+                m0 = template_instance.get_M0()
+                if m0 < 1.0:
+                    penalty = (1.0 - m0) ** 2
+                    total_penalty = total_penalty + penalty
+            
+            if hasattr(template_instance, 'get_K0'):
+                k0 = template_instance.get_K0()
+                # 注意：对于某些模板，K0 可能等于 K（固定值），不需要惩罚
+                # 只惩罚可学习的 K0 参数
+                if hasattr(template_instance, 'log_K0') and k0 < 1.0:
+                    penalty = (1.0 - k0) ** 2
+                    total_penalty = total_penalty + penalty
+            
+            if hasattr(template_instance, 'get_N0'):
+                n0 = template_instance.get_N0()
+                # 注意：对于某些模板，N0 可能等于 N（固定值），不需要惩罚
+                # 只惩罚可学习的 N0 参数
+                if hasattr(template_instance, 'log_N0') and n0 < 1.0:
+                    penalty = (1.0 - n0) ** 2
+                    total_penalty = total_penalty + penalty
+    
+    return total_penalty
+
+
+def calculate_template_constraint_penalty(
+    mapping_params: 'MappingParameters',
+    hardware_params: 'HardwareParameters',
+    graph: 'ComputationGraph'
+) -> torch.Tensor:
+    """
+    新的模板约束惩罚函数：实现 Buffer 容量约束。
+    
+    关键约束：
+    1. Buffer 容量约束：对于任何计算组在任何模板下，计算出的总 Buffer 需求
+       不能超过硬件提供的总 Buffer 容量
+    2. Tiling 因子有效性：已在 calculate_penalty_loss 中处理
+    
+    Args:
+        mapping_params: 映射策略管理器
+        hardware_params: 硬件参数
+        graph: 计算图
+        
+    Returns:
+        总约束惩罚值
+    """
+    total_penalty = torch.tensor(0.0, dtype=torch.float32)
+    available_buffer_bytes = hardware_params.get_buffer_size_bytes()
+    
+    # 获取所有决策模块
+    all_decision_modules = mapping_params.get_all_decision_modules()
+    group_mapping = mapping_params.group_mapping
+    
+    # === 遍历所有计算组，检查每个模板的 Buffer 容量约束 ===
+    for group_key, decision_module in all_decision_modules.items():
+        group_layers = group_mapping[group_key]
+        
+        # 对该组的每个可能模板检查约束
+        for template_name, template_instance in decision_module.templates.items():
+            
+            # 计算该模板在该组下的 Buffer 需求
+            max_buffer_requirements = {'input': torch.tensor(0.0), 'weight': torch.tensor(0.0), 'output': torch.tensor(0.0)}
+            
+            for layer_name in group_layers:
+                # 使用模板计算该层的缓冲区需求
+                layer_buffer_reqs = template_instance.get_buffer_requirements()
+                
+                # 取各张量的最大缓冲区需求（遵循融合链的 max_e(BufReq_e) 规则）
+                for tensor_type in ['input', 'weight', 'output']:
+                    if tensor_type in layer_buffer_reqs:
+                        max_buffer_requirements[tensor_type] = torch.maximum(
+                            max_buffer_requirements[tensor_type],
+                            layer_buffer_reqs[tensor_type]
+                        )
+            
+            # 计算总 Buffer 需求（以 bytes 为单位）
+            config = Config.get_instance()
+            total_buffer_requirement_bytes = torch.tensor(0.0, dtype=torch.float32)
+            
+            for tensor_type, buffer_req_words in max_buffer_requirements.items():
+                buffer_req_bytes = buffer_req_words * config.BYTES_PER_ELEMENT
+                total_buffer_requirement_bytes = total_buffer_requirement_bytes + buffer_req_bytes
+            
+            # === 检查 Buffer 容量约束 ===
+            if total_buffer_requirement_bytes > available_buffer_bytes:
+                # 惩罚：超出量的平方
+                excess = total_buffer_requirement_bytes - available_buffer_bytes
+                penalty = (excess / available_buffer_bytes) ** 2  # 归一化惩罚
+                total_penalty = total_penalty + penalty
+    
+    # === 硬件参数的合理性约束 ===
+    num_pes = hardware_params.get_num_pes()
+    buffer_size_kb = hardware_params.get_buffer_size_kb()
+    
+    # 惩罚不合理的硬件配置
+    if num_pes < 1.0:
+        total_penalty = total_penalty + (1.0 - num_pes) ** 2
+    
+    if num_pes > 1024.0:  # 超过 1024 个 PE 不现实
+        total_penalty = total_penalty + (num_pes - 1024.0) ** 2
+    
+    if buffer_size_kb < 1.0:  # 小于 1 KB 不现实
+        total_penalty = total_penalty + (1.0 - buffer_size_kb) ** 2
+    
+    if buffer_size_kb > 10240.0:  # 超过 10 MB 不现实
+        total_penalty = total_penalty + (buffer_size_kb - 10240.0) ** 2
     
     return total_penalty
 
@@ -279,7 +388,7 @@ def calculate_hardware_constraint_penalty(
     # Check buffer constraints for individual layers
     for layer_name, layer_info in graph.layers.items():
         layer_mapping = mapping_params.get_mapping_by_original_name(layer_name)
-        buffer_reqs = layer_mapping.calculate_buffer_requirements(layer_info['dims'])
+        buffer_reqs = layer_mapping.get_buffer_requirements()
         required_buffer_bytes = sum(buffer_reqs.values())
         
         # Penalty if required buffer exceeds available buffer
@@ -449,6 +558,619 @@ def calculate_macs(dims: Dict[str, int], op_type: str = 'Conv') -> torch.Tensor:
                 dims['N'] * dims['K'] * dims.get('P', 1) * dims.get('Q', 1),
                 dtype=torch.float32
             )
+
+# ============================
+# 可微映射模板 (Differentiable Mapping Templates, DMT)
+# ============================
+
+class DifferentiableMappingTemplate(nn.Module):
+    """
+    可微映射模板的抽象基类。
+    
+    映射模板定义了算子（或融合算子组）在硬件上执行时的数据排布和计算顺序的
+    结构化、模式化描述。它将无限的映射可能性约束在几个有明确物理意义的、
+    可分析的模式中。
+    
+    Args:
+        dims: 层的维度信息，包含 M, K, N 等维度
+        template_name: 模板名称，用于标识
+    """
+    
+    def __init__(self, dims: Dict[str, int], template_name: str):
+        super().__init__()
+        self.dims = dims
+        self.template_name = template_name
+        self.config = Config.get_instance()
+        
+        # 每个模板都有自己的可学习参数
+        self._init_template_parameters()
+    
+    def _init_template_parameters(self):
+        """初始化模板特定的可学习参数。子类需要重写此方法。"""
+        raise NotImplementedError("Subclasses must implement _init_template_parameters")
+    
+    def forward(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
+        """
+        模板的前向传播，计算性能指标。
+        
+        Returns:
+            Dict containing latency, energy, buffer_requirements, etc.
+        """
+        raise NotImplementedError("Subclasses must implement forward")
+    
+    def get_buffer_requirements(self) -> Dict[str, torch.Tensor]:
+        """计算此模板的缓冲区需求。"""
+        raise NotImplementedError("Subclasses must implement get_buffer_requirements")
+    
+    def get_access_counts(self) -> Dict[str, torch.Tensor]:
+        """计算此模板的访存次数。"""
+        raise NotImplementedError("Subclasses must implement get_access_counts")
+
+
+class DMT_GEMM_Full(DifferentiableMappingTemplate):
+    """
+    GEMM Full 映射模板 (FFMT-Full)
+    
+    只对 M 维度进行切分，一次性读入完整的输入行，并产生完整的输出行。
+    对 Buffer 的 K 和 N 维度占用最大。
+    
+    在这个模板中：K0=K, N0=N (完整维度), 只有 M0 是可学习的切分参数
+    """
+    
+    def __init__(self, dims: Dict[str, int]):
+        super().__init__(dims, "GEMM_Full")
+    
+    def _init_template_parameters(self):
+        """
+        初始化 Full 模板的参数：M0 (M维度的切分因子)
+        
+        Full 模式特点：K0=K, N0=N，只对 M 维度进行切分
+        因此 M1 = M/M0, K1=1, N1=1
+        """
+        M = self.dims.get('M', self.dims.get('N', 1))  # 兼容不同的命名约定
+        K = self.dims.get('K', self.dims.get('C', 1))
+        N = self.dims.get('N', self.dims.get('P', self.dims.get('Q', 1)))
+        
+        # 使用对数尺度参数化，确保值始终为正
+        # 初始化为维度的平方根，这是一个合理的起始点
+        epsilon = 1e-6
+        init_m0 = max(1.0, min(M, np.sqrt(M)))
+        
+        self.log_M0 = nn.Parameter(torch.log(torch.tensor(init_m0 + epsilon, dtype=torch.float32)))
+        
+        # 存储固定的维度值（不可学习）
+        self.register_buffer('M_total', torch.tensor(M, dtype=torch.float32))
+        self.register_buffer('K_total', torch.tensor(K, dtype=torch.float32))
+        self.register_buffer('N_total', torch.tensor(N, dtype=torch.float32))
+    
+    def get_M0(self) -> torch.Tensor:
+        """获取 M 维度的切分因子"""
+        return torch.exp(self.log_M0)
+    
+    def get_K0(self) -> torch.Tensor:
+        """Full 模式：K0 = K (完整维度)"""
+        return self.K_total
+    
+    def get_N0(self) -> torch.Tensor:
+        """Full 模式：N0 = N (完整维度)"""
+        return self.N_total
+    
+    def get_M1(self) -> torch.Tensor:
+        """计算 M1 = M / M0"""
+        return self.M_total / self.get_M0()
+    
+    def get_K1(self) -> torch.Tensor:
+        """Full 模式：K1 = 1"""
+        return torch.tensor(1.0, dtype=torch.float32)
+    
+    def get_N1(self) -> torch.Tensor:
+        """Full 模式：N1 = 1"""
+        return torch.tensor(1.0, dtype=torch.float32)
+    
+    def forward(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
+        """计算 Full 模板的性能指标"""
+        buffer_reqs = self.get_buffer_requirements()
+        access_counts = self.get_access_counts()
+        
+        return {
+            'buffer_requirements': buffer_reqs,
+            'access_counts': access_counts,
+            'template_name': self.template_name
+        }
+    
+    def get_buffer_requirements(self) -> Dict[str, torch.Tensor]:
+        """
+        Full 模板的缓冲区需求计算
+        
+        基于论文公式：
+        - BufReq_I = M0 * K0 = M0 * K
+        - BufReq_W = K0 * N0 = K * N  
+        - BufReq_O = M0 * N0 = M0 * N
+        """
+        M0 = self.get_M0()
+        K0 = self.get_K0()  # = K
+        N0 = self.get_N0()  # = N
+        
+        return {
+            'input': M0 * K0,      # M0 * K
+            'weight': K0 * N0,     # K * N (最大)
+            'output': M0 * N0      # M0 * N
+        }
+    
+    def get_access_counts(self) -> Dict[str, torch.Tensor]:
+        """
+        Full 模板的 DRAM 访问次数计算
+        
+        基于论文公式：
+        - Access_I = M * K * N1 = M * K * 1 = M * K
+        - Access_W = K * N * M1 = K * N * (M/M0)
+        - Access_O = M * N
+        """
+        M1 = self.get_M1()  # M / M0
+        
+        return {
+            'input': self.M_total * self.K_total,                    # M * K
+            'weight': self.K_total * self.N_total * M1,              # K * N * M1  
+            'output': self.M_total * self.N_total                    # M * N
+        }
+
+
+class DMT_GEMM_TiledK(DifferentiableMappingTemplate):
+    """
+    GEMM TiledK 映射模板 (FFMT-TiledK)
+    
+    对 M 和 K 维度进行切分。只消耗输入行的子集（sub-partition），
+    并产生部分和（partial sums）。
+    
+    在这个模板中：N0=N (完整维度), M0 和 K0 是可学习的切分参数
+    """
+    
+    def __init__(self, dims: Dict[str, int]):
+        super().__init__(dims, "GEMM_TiledK")
+    
+    def _init_template_parameters(self):
+        """
+        初始化 TiledK 模板的参数：M0, K0 (M和K维度的切分因子)
+        
+        TiledK 模式特点：N0=N，对 M 和 K 维度进行切分
+        因此 M1 = M/M0, K1 = K/K0, N1=1
+        """
+        M = self.dims.get('M', self.dims.get('N', 1))
+        K = self.dims.get('K', self.dims.get('C', 1))
+        N = self.dims.get('N', self.dims.get('P', self.dims.get('Q', 1)))
+        
+        # 使用对数尺度参数化，确保值始终为正
+        epsilon = 1e-6
+        init_m0 = max(1.0, min(M, np.sqrt(M)))
+        init_k0 = max(1.0, min(K, np.sqrt(K)))
+        
+        self.log_M0 = nn.Parameter(torch.log(torch.tensor(init_m0 + epsilon, dtype=torch.float32)))
+        self.log_K0 = nn.Parameter(torch.log(torch.tensor(init_k0 + epsilon, dtype=torch.float32)))
+        
+        # 存储固定的维度值（不可学习）
+        self.register_buffer('M_total', torch.tensor(M, dtype=torch.float32))
+        self.register_buffer('K_total', torch.tensor(K, dtype=torch.float32))
+        self.register_buffer('N_total', torch.tensor(N, dtype=torch.float32))
+    
+    def get_M0(self) -> torch.Tensor:
+        """获取 M 维度的切分因子"""
+        return torch.exp(self.log_M0)
+    
+    def get_K0(self) -> torch.Tensor:
+        """获取 K 维度的切分因子"""
+        return torch.exp(self.log_K0)
+    
+    def get_N0(self) -> torch.Tensor:
+        """TiledK 模式：N0 = N (完整维度)"""
+        return self.N_total
+    
+    def get_M1(self) -> torch.Tensor:
+        """计算 M1 = M / M0"""
+        return self.M_total / self.get_M0()
+    
+    def get_K1(self) -> torch.Tensor:
+        """计算 K1 = K / K0"""
+        return self.K_total / self.get_K0()
+    
+    def get_N1(self) -> torch.Tensor:
+        """TiledK 模式：N1 = 1"""
+        return torch.tensor(1.0, dtype=torch.float32)
+    
+    def forward(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
+        """计算 TiledK 模板的性能指标"""
+        buffer_reqs = self.get_buffer_requirements()
+        access_counts = self.get_access_counts()
+        
+        return {
+            'buffer_requirements': buffer_reqs,
+            'access_counts': access_counts,
+            'template_name': self.template_name
+        }
+    
+    def get_buffer_requirements(self) -> Dict[str, torch.Tensor]:
+        """
+        TiledK 模板的缓冲区需求计算
+        
+        基于论文公式：
+        - BufReq_I = M0 * K0
+        - BufReq_W = K0 * N0 = K0 * N
+        - BufReq_O = M0 * N0 = M0 * N
+        """
+        M0 = self.get_M0()
+        K0 = self.get_K0()
+        N0 = self.get_N0()  # = N
+        
+        return {
+            'input': M0 * K0,       # M0 * K0
+            'weight': K0 * N0,      # K0 * N
+            'output': M0 * N0       # M0 * N
+        }
+    
+    def get_access_counts(self) -> Dict[str, torch.Tensor]:
+        """
+        TiledK 模板的 DRAM 访问次数计算
+        
+        基于论文公式：
+        - Access_I = M * K * N1 = M * K * 1 = M * K
+        - Access_W = K * N * M1 = K * N * (M/M0)
+        - Access_O = M * N
+        """
+        M1 = self.get_M1()  # M / M0
+        
+        return {
+            'input': self.M_total * self.K_total,                    # M * K
+            'weight': self.K_total * self.N_total * M1,              # K * N * M1
+            'output': self.M_total * self.N_total                    # M * N
+        }
+
+
+class DMT_GEMM_TiledN(DifferentiableMappingTemplate):
+    """
+    GEMM TiledN 映射模板 (FFMT-TiledN)
+    
+    对 M 和 N 维度进行切分。消耗完整的输入行，但只产生输出行的子集。
+    
+    在这个模板中：K0=K (完整维度), M0 和 N0 是可学习的切分参数
+    """
+    
+    def __init__(self, dims: Dict[str, int]):
+        super().__init__(dims, "GEMM_TiledN")
+    
+    def _init_template_parameters(self):
+        """
+        初始化 TiledN 模板的参数：M0, N0 (M和N维度的切分因子)
+        
+        TiledN 模式特点：K0=K，对 M 和 N 维度进行切分
+        因此 M1 = M/M0, K1=1, N1 = N/N0
+        """
+        M = self.dims.get('M', self.dims.get('N', 1))
+        K = self.dims.get('K', self.dims.get('C', 1))
+        N = self.dims.get('N', self.dims.get('P', self.dims.get('Q', 1)))
+        
+        # 使用对数尺度参数化，确保值始终为正
+        epsilon = 1e-6
+        init_m0 = max(1.0, min(M, np.sqrt(M)))
+        init_n0 = max(1.0, min(N, np.sqrt(N)))
+        
+        self.log_M0 = nn.Parameter(torch.log(torch.tensor(init_m0 + epsilon, dtype=torch.float32)))
+        self.log_N0 = nn.Parameter(torch.log(torch.tensor(init_n0 + epsilon, dtype=torch.float32)))
+        
+        # 存储固定的维度值（不可学习）
+        self.register_buffer('M_total', torch.tensor(M, dtype=torch.float32))
+        self.register_buffer('K_total', torch.tensor(K, dtype=torch.float32))
+        self.register_buffer('N_total', torch.tensor(N, dtype=torch.float32))
+    
+    def get_M0(self) -> torch.Tensor:
+        """获取 M 维度的切分因子"""
+        return torch.exp(self.log_M0)
+    
+    def get_K0(self) -> torch.Tensor:
+        """TiledN 模式：K0 = K (完整维度)"""
+        return self.K_total
+    
+    def get_N0(self) -> torch.Tensor:
+        """获取 N 维度的切分因子"""
+        return torch.exp(self.log_N0)
+    
+    def get_M1(self) -> torch.Tensor:
+        """计算 M1 = M / M0"""
+        return self.M_total / self.get_M0()
+    
+    def get_K1(self) -> torch.Tensor:
+        """TiledN 模式：K1 = 1"""
+        return torch.tensor(1.0, dtype=torch.float32)
+    
+    def get_N1(self) -> torch.Tensor:
+        """计算 N1 = N / N0"""
+        return self.N_total / self.get_N0()
+    
+    def forward(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
+        """计算 TiledN 模板的性能指标"""
+        buffer_reqs = self.get_buffer_requirements()
+        access_counts = self.get_access_counts()
+        
+        return {
+            'buffer_requirements': buffer_reqs,
+            'access_counts': access_counts,
+            'template_name': self.template_name
+        }
+    
+    def get_buffer_requirements(self) -> Dict[str, torch.Tensor]:
+        """
+        TiledN 模板的缓冲区需求计算
+        
+        基于论文公式：
+        - BufReq_I = M0 * K0 = M0 * K
+        - BufReq_W = K0 * N0 = K * N0
+        - BufReq_O = M0 * N0
+        """
+        M0 = self.get_M0()
+        K0 = self.get_K0()  # = K
+        N0 = self.get_N0()
+        
+        return {
+            'input': M0 * K0,       # M0 * K
+            'weight': K0 * N0,      # K * N0
+            'output': M0 * N0       # M0 * N0
+        }
+    
+    def get_access_counts(self) -> Dict[str, torch.Tensor]:
+        """
+        TiledN 模板的 DRAM 访问次数计算
+        
+        基于论文公式：
+        - Access_I = M * K * N1 = M * K * (N/N0)
+        - Access_W = K * N * M1 = K * N * (M/M0)
+        - Access_O = M * N
+        """
+        M1 = self.get_M1()  # M / M0
+        N1 = self.get_N1()  # N / N0
+        
+        return {
+            'input': self.M_total * self.K_total * N1,               # M * K * N1
+            'weight': self.K_total * self.N_total * M1,              # K * N * M1
+            'output': self.M_total * self.N_total                    # M * N
+        }
+
+
+class DMT_GEMM_TiledKN(DifferentiableMappingTemplate):
+    """
+    GEMM TiledKN 映射模板 (FFMT-TiledKN)
+    
+    对 M, K, N 三个维度都进行切分。消耗输入行的子集，也产生部分和的输出子集。
+    这是最灵活、对 Buffer 要求最低的模式。
+    
+    在这个模板中：M0, K0, N0 都是可学习的切分参数
+    """
+    
+    def __init__(self, dims: Dict[str, int]):
+        super().__init__(dims, "GEMM_TiledKN")
+    
+    def _init_template_parameters(self):
+        """
+        初始化 TiledKN 模板的参数：M0, K0, N0 (M, K, N三个维度的切分因子)
+        
+        TiledKN 模式特点：对所有维度进行切分
+        因此 M1 = M/M0, K1 = K/K0, N1 = N/N0
+        """
+        M = self.dims.get('M', self.dims.get('N', 1))
+        K = self.dims.get('K', self.dims.get('C', 1))
+        N = self.dims.get('N', self.dims.get('P', self.dims.get('Q', 1)))
+        
+        # 使用对数尺度参数化，确保值始终为正
+        epsilon = 1e-6
+        init_m0 = max(1.0, min(M, np.sqrt(M)))
+        init_k0 = max(1.0, min(K, np.sqrt(K)))
+        init_n0 = max(1.0, min(N, np.sqrt(N)))
+        
+        self.log_M0 = nn.Parameter(torch.log(torch.tensor(init_m0 + epsilon, dtype=torch.float32)))
+        self.log_K0 = nn.Parameter(torch.log(torch.tensor(init_k0 + epsilon, dtype=torch.float32)))
+        self.log_N0 = nn.Parameter(torch.log(torch.tensor(init_n0 + epsilon, dtype=torch.float32)))
+        
+        # 存储固定的维度值（不可学习）
+        self.register_buffer('M_total', torch.tensor(M, dtype=torch.float32))
+        self.register_buffer('K_total', torch.tensor(K, dtype=torch.float32))
+        self.register_buffer('N_total', torch.tensor(N, dtype=torch.float32))
+    
+    def get_M0(self) -> torch.Tensor:
+        """获取 M 维度的切分因子"""
+        return torch.exp(self.log_M0)
+    
+    def get_K0(self) -> torch.Tensor:
+        """获取 K 维度的切分因子"""
+        return torch.exp(self.log_K0)
+    
+    def get_N0(self) -> torch.Tensor:
+        """获取 N 维度的切分因子"""
+        return torch.exp(self.log_N0)
+    
+    def get_M1(self) -> torch.Tensor:
+        """计算 M1 = M / M0"""
+        return self.M_total / self.get_M0()
+    
+    def get_K1(self) -> torch.Tensor:
+        """计算 K1 = K / K0"""
+        return self.K_total / self.get_K0()
+    
+    def get_N1(self) -> torch.Tensor:
+        """计算 N1 = N / N0"""
+        return self.N_total / self.get_N0()
+    
+    def forward(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
+        """计算 TiledKN 模板的性能指标"""
+        buffer_reqs = self.get_buffer_requirements()
+        access_counts = self.get_access_counts()
+        
+        return {
+            'buffer_requirements': buffer_reqs,
+            'access_counts': access_counts,
+            'template_name': self.template_name
+        }
+    
+    def get_buffer_requirements(self) -> Dict[str, torch.Tensor]:
+        """
+        TiledKN 模板的缓冲区需求计算 (最低缓冲区需求)
+        
+        基于论文公式：
+        - BufReq_I = M0 * K0
+        - BufReq_W = K0 * N0
+        - BufReq_O = M0 * N0
+        """
+        M0 = self.get_M0()
+        K0 = self.get_K0()
+        N0 = self.get_N0()
+        
+        return {
+            'input': M0 * K0,       # M0 * K0
+            'weight': K0 * N0,      # K0 * N0
+            'output': M0 * N0       # M0 * N0
+        }
+    
+    def get_access_counts(self) -> Dict[str, torch.Tensor]:
+        """
+        TiledKN 模板的 DRAM 访问次数计算
+        
+        基于论文公式：
+        - Access_I = M * K * N1 = M * K * (N/N0)
+        - Access_W = K * N * M1 = K * N * (M/M0)
+        - Access_O = M * N
+        """
+        M1 = self.get_M1()  # M / M0
+        N1 = self.get_N1()  # N / N0
+        
+        return {
+            'input': self.M_total * self.K_total * N1,               # M * K * N1
+            'weight': self.K_total * self.N_total * M1,              # K * N * M1
+            'output': self.M_total * self.N_total                    # M * N
+        }
+
+
+class MappingDecisionModule(nn.Module):
+    """
+    映射决策模块 (Mapping Decision Module)
+    
+    为一个特定的计算组（层或融合组）管理映射模板的选择和参数。
+    包含所有可能的映射模板实例以及选择这些模板的可学习 logits。
+    
+    Args:
+        dims: 该计算组的维度信息
+        group_name: 计算组的名称（用于调试和日志）
+    """
+    
+    def __init__(self, dims: Dict[str, int], group_name: str):
+        super().__init__()
+        
+        self.dims = dims
+        self.group_name = group_name
+        
+        # === 模板选择参数 ===
+        # 使用可学习的 logits，通过 softmax 得到选择概率
+        # logits 的维度等于可选模板数量（当前是4个 GEMM 模板）
+        self.template_selection_logits = nn.Parameter(
+            torch.randn(4, dtype=torch.float32)  # [Full, TiledK, TiledN, TiledKN]
+        )
+        
+        # === 模板实例 ===
+        # 为每个可能的映射模板创建实例，每个模板都有独立的可学习参数
+        self.templates = nn.ModuleDict({
+            'full': DMT_GEMM_Full(dims),
+            'tiled_k': DMT_GEMM_TiledK(dims),
+            'tiled_n': DMT_GEMM_TiledN(dims),
+            'tiled_kn': DMT_GEMM_TiledKN(dims)
+        })
+        
+        # 模板名称列表，用于索引
+        self.template_names = ['full', 'tiled_k', 'tiled_n', 'tiled_kn']
+    
+    def get_template_probabilities(self) -> torch.Tensor:
+        """
+        获取当前的模板选择概率分布。
+        
+        Returns:
+            四种模板的选择概率 [P(Full), P(TiledK), P(TiledN), P(TiledKN)]
+        """
+        return torch.softmax(self.template_selection_logits, dim=0)
+    
+    def get_selected_template(self) -> DifferentiableMappingTemplate:
+        """
+        根据当前学习到的概率分布，选择最佳映射模板。
+        
+        Returns:
+            选中的映射模板实例
+        """
+        probabilities = self.get_template_probabilities()
+        selected_idx = torch.argmax(probabilities).item()
+        selected_template_name = self.template_names[selected_idx]
+        return self.templates[selected_template_name]
+    
+    def get_template_by_name(self, template_name: str) -> DifferentiableMappingTemplate:
+        """
+        根据名称获取特定的模板实例。
+        
+        Args:
+            template_name: 模板名称 ('full', 'tiled_k', 'tiled_n', 'tiled_kn')
+            
+        Returns:
+            指定的映射模板实例
+        """
+        if template_name not in self.templates:
+            raise ValueError(f"Unknown template name: {template_name}")
+        return self.templates[template_name]
+    
+    def forward(self, use_probabilistic_selection: bool = False) -> Dict[str, torch.Tensor]:
+        """
+        前向传播：计算该决策模块的性能指标。
+        
+        Args:
+            use_probabilistic_selection: 是否使用概率性选择（用于训练）
+                                       还是确定性选择（用于推理）
+        
+        Returns:
+            性能指标字典，包含缓冲区需求、访存次数等
+        """
+        if use_probabilistic_selection:
+            # 训练时：使用加权平均，考虑所有模板的贡献
+            probabilities = self.get_template_probabilities()
+            
+            # 收集所有模板的结果
+            all_results = {}
+            for i, template_name in enumerate(self.template_names):
+                template_result = self.templates[template_name].forward()
+                for key, value in template_result.items():
+                    if key not in all_results:
+                        all_results[key] = []
+                    all_results[key].append(value * probabilities[i])
+            
+            # 加权求和
+            weighted_results = {}
+            for key, value_list in all_results.items():
+                if key == 'template_name':
+                    # 模板名称特殊处理，返回概率最高的模板名称
+                    selected_template = self.get_selected_template()
+                    weighted_results[key] = selected_template.template_name
+                else:
+                    weighted_results[key] = sum(value_list)
+            
+            return weighted_results
+        else:
+            # 推理时：只使用选中的模板
+            selected_template = self.get_selected_template()
+            return selected_template.forward()
+    
+    def __str__(self):
+        probabilities = self.get_template_probabilities()
+        selected_template = self.get_selected_template()
+        
+        lines = [f"MappingDecisionModule for '{self.group_name}':"]
+        lines.append("  Template Probabilities:")
+        lines.append(f"    Full: {probabilities[0].item():.4f}")
+        lines.append(f"    TiledK: {probabilities[1].item():.4f}")
+        lines.append(f"    TiledN: {probabilities[2].item():.4f}")
+        lines.append(f"    TiledKN: {probabilities[3].item():.4f}")
+        lines.append(f"  Selected Template: {selected_template.template_name}")
+        
+        return "\n".join(lines)
+
 
 class LayerMapping(nn.Module):
     """
@@ -651,33 +1373,232 @@ class ComputationGraph:
 
 class MappingParameters(nn.Module):
     """
-    Learnable parameters for layer mappings.
-    Currently implements single-level tiling with L2 buffer.
+    映射策略管理器 (Mapping Strategy Manager)
+    
+    重构后的映射策略管理器，使用 MappingDecisionModule 来管理映射策略。
+    为计算图中的每一个融合组（fusion group）和每一个未被融合的独立层（standalone layer）
+    都创建一个对应的 MappingDecisionModule。
+    
+    这种设计将优化的对象从"独立层的平铺参数"转变为"为一个计算组选择最佳映射模板，
+    并微调该模板参数"。
     """
+    
     def __init__(self, graph: ComputationGraph):
         super().__init__()
         
-        # Create mapping parameters for each layer
-        self.mappings = nn.ModuleDict()
-        self.layer_name_mapping = {}  # Map sanitized names back to original names
+        self.graph = graph
         
+        # === 决策模块管理 ===
+        # 为每个计算组（融合组或独立层）创建一个映射决策模块
+        self.decision_modules = nn.ModuleDict()
+        
+        # 跟踪哪些层属于融合组，哪些是独立层
+        self.fused_layers = set()
+        self.standalone_layers = set()
+        self.group_mapping = {}  # 映射：组名 -> 组内层名列表
+        
+        # === 步骤1：处理融合组 ===
+        for fusion_group in graph.fusion_groups:
+            if fusion_group:  # 确保融合组非空
+                group_key = self._get_sanitized_group_key(fusion_group)
+                
+                # 标记这些层为已融合
+                for layer_name in fusion_group:
+                    self.fused_layers.add(layer_name)
+                
+                # 计算融合组的代表性维度
+                # TODO: 实际应用中需要更复杂的融合维度计算
+                representative_dims = self._compute_fusion_group_dims(fusion_group)
+                
+                # 为融合组创建决策模块
+                self.decision_modules[group_key] = MappingDecisionModule(
+                    dims=representative_dims,
+                    group_name=f"FusionGroup_{group_key}"
+                )
+                
+                # 记录组映射
+                self.group_mapping[group_key] = fusion_group.copy()
+        
+        # === 步骤2：处理独立层（未被融合的层）===
         for layer_name in graph.get_layer_names():
-            sanitized_name = sanitize_layer_name(layer_name)
-            self.mappings[sanitized_name] = LayerMapping(graph.layers[layer_name]['dims'])
-            self.layer_name_mapping[sanitized_name] = layer_name
-
-    def get_mapping_by_original_name(self, original_name: str) -> 'LayerMapping':
-        """Get layer mapping using the original layer name."""
-        sanitized_name = sanitize_layer_name(original_name)
-        return self.mappings[sanitized_name]
-
+            if layer_name not in self.fused_layers:
+                self.standalone_layers.add(layer_name)
+                
+                # 获取层的维度信息
+                layer_dims = graph.layers[layer_name]['dims']
+                
+                # 为独立层创建决策模块
+                sanitized_layer_name = sanitize_layer_name(layer_name)
+                self.decision_modules[sanitized_layer_name] = MappingDecisionModule(
+                    dims=layer_dims,
+                    group_name=f"Layer_{layer_name}"
+                )
+                
+                # 记录组映射（独立层也视为只有一个成员的"组"）
+                self.group_mapping[sanitized_layer_name] = [layer_name]
+    
+    def _get_sanitized_group_key(self, fusion_group: List[str]) -> str:
+        """为融合组生成清理后的键名"""
+        group_key = self.graph.get_fusion_group_key(fusion_group)
+        return sanitize_layer_name(group_key)
+    
+    def _compute_fusion_group_dims(self, fusion_group: List[str]) -> Dict[str, int]:
+        """
+        计算融合组的代表性维度。
+        
+        当前实现：使用第一个层的维度作为近似
+        TODO: 实际应用中需要更复杂的融合维度计算，考虑层间的数据流和变换
+        
+        Args:
+            fusion_group: 融合组中的层名称列表
+            
+        Returns:
+            融合组的代表性维度字典
+        """
+        if not fusion_group:
+            raise ValueError("Fusion group cannot be empty")
+        
+        # 简单策略：使用第一个层的维度
+        first_layer_dims = self.graph.layers[fusion_group[0]]['dims']
+        
+        # TODO: 更复杂的融合维度计算可以在这里实现
+        # 例如，考虑各层的维度变换、数据重用模式等
+        
+        return first_layer_dims.copy()
+    
+    def get_decision_module_for_layer(self, layer_name: str) -> MappingDecisionModule:
+        """
+        获取指定层对应的决策模块。
+        
+        Args:
+            layer_name: 层名称
+            
+        Returns:
+            该层对应的映射决策模块（可能是独立层的模块，也可能是融合组的模块）
+        """
+        # 首先检查是否为独立层
+        sanitized_layer_name = sanitize_layer_name(layer_name)
+        if sanitized_layer_name in self.decision_modules:
+            return self.decision_modules[sanitized_layer_name]
+        
+        # 如果不是独立层，查找包含该层的融合组
+        for group_key, group_layers in self.group_mapping.items():
+            if layer_name in group_layers and len(group_layers) > 1:  # 融合组
+                return self.decision_modules[group_key]
+        
+        raise ValueError(f"Layer '{layer_name}' not found in any decision module")
+    
+    def get_decision_module_for_fusion_group(self, fusion_group: List[str]) -> MappingDecisionModule:
+        """
+        获取指定融合组对应的决策模块。
+        
+        Args:
+            fusion_group: 融合组中的层名称列表
+            
+        Returns:
+            该融合组对应的映射决策模块
+        """
+        group_key = self._get_sanitized_group_key(fusion_group)
+        if group_key not in self.decision_modules:
+            raise ValueError(f"Fusion group {fusion_group} not found in decision modules")
+        
+        return self.decision_modules[group_key]
+    
+    def get_all_decision_modules(self) -> Dict[str, MappingDecisionModule]:
+        """
+        获取所有的决策模块。
+        
+        Returns:
+            字典：{组名 -> MappingDecisionModule}
+        """
+        return dict(self.decision_modules)
+    
+    # === 兼容性方法：为了与现有代码兼容而保留 ===
+    def get_mapping_by_original_name(self, original_name: str) -> DifferentiableMappingTemplate:
+        """
+        兼容性方法：根据层名称获取当前选中的映射模板。
+        注意：这个方法返回的是 DifferentiableMappingTemplate 而不是 LayerMapping。
+        """
+        decision_module = self.get_decision_module_for_layer(original_name)
+        return decision_module.get_selected_template()
+    
+    def get_layer_template_probabilities(self, layer_name: str) -> torch.Tensor:
+        """
+        兼容性方法：获取指定层的模板选择概率分布。
+        
+        Args:
+            layer_name: 层名称
+            
+        Returns:
+            四种模板的选择概率 [P(Full), P(TiledK), P(TiledN), P(TiledKN)]
+        """
+        decision_module = self.get_decision_module_for_layer(layer_name)
+        return decision_module.get_template_probabilities()
+    
+    def get_layer_selected_template(self, layer_name: str) -> DifferentiableMappingTemplate:
+        """
+        兼容性方法：根据当前学习到的概率分布，为指定层选择最佳映射模板。
+        
+        Args:
+            layer_name: 层名称
+            
+        Returns:
+            选中的映射模板实例
+        """
+        decision_module = self.get_decision_module_for_layer(layer_name)
+        return decision_module.get_selected_template()
+    
+    def get_fusion_group_template_probabilities(self, fusion_group: List[str]) -> torch.Tensor:
+        """
+        兼容性方法：获取指定融合组的模板选择概率分布。
+        
+        Args:
+            fusion_group: 融合组中的层名称列表
+            
+        Returns:
+            四种模板的选择概率 [P(Full), P(TiledK), P(TiledN), P(TiledKN)]
+        """
+        decision_module = self.get_decision_module_for_fusion_group(fusion_group)
+        return decision_module.get_template_probabilities()
+    
+    def get_fusion_group_selected_template(self, fusion_group: List[str]) -> DifferentiableMappingTemplate:
+        """
+        兼容性方法：根据当前学习到的概率分布，为指定融合组选择最佳映射模板。
+        
+        Args:
+            fusion_group: 融合组中的层名称列表
+            
+        Returns:
+            选中的映射模板实例
+        """
+        decision_module = self.get_decision_module_for_fusion_group(fusion_group)
+        return decision_module.get_selected_template()
+    
     def __str__(self):
-        lines = ["Mapping Parameters:"]
-        for sanitized_name, mapping in self.mappings.items():
-            original_name = self.layer_name_mapping[sanitized_name]
-            lines.append(f"  {original_name}:")
-            for dim, factor in mapping.temporal_factors_L2.items():
-                lines.append(f"    {dim}: {factor.item():.4f}")
+        lines = ["Mapping Strategy Manager (DMT-based):"]
+        lines.append(f"  Total Decision Modules: {len(self.decision_modules)}")
+        lines.append(f"  Standalone Layers: {len(self.standalone_layers)}")
+        lines.append(f"  Fusion Groups: {len(self.graph.fusion_groups)}")
+        lines.append("")
+        
+        # 显示所有决策模块的状态
+        for group_key, decision_module in self.decision_modules.items():
+            group_layers = self.group_mapping.get(group_key, [])
+            if len(group_layers) == 1:
+                lines.append(f"  Standalone Layer: {group_layers[0]}")
+            else:
+                lines.append(f"  Fusion Group: {group_layers}")
+            
+            # 显示概率分布和选中的模板
+            probabilities = decision_module.get_template_probabilities()
+            selected_template = decision_module.get_selected_template()
+            lines.append(f"    Probabilities: Full={probabilities[0].item():.3f}, "
+                        f"TiledK={probabilities[1].item():.3f}, "
+                        f"TiledN={probabilities[2].item():.3f}, "
+                        f"TiledKN={probabilities[3].item():.3f}")
+            lines.append(f"    Selected: {selected_template.template_name}")
+            lines.append("")
+        
         return "\n".join(lines)
 
 class HardwareParameters(nn.Module):
@@ -808,8 +1729,7 @@ def calculate_fused_group_buffer_req(
     total_buffer_req = torch.tensor(0.0)
     for layer_name in group:
         layer_mapping = mapping_params.get_mapping_by_original_name(layer_name)
-        layer_dims = graph.layers[layer_name]['dims']
-        buffer_reqs = layer_mapping.calculate_buffer_requirements(layer_dims)
+        buffer_reqs = layer_mapping.get_buffer_requirements()
         total_buffer_req += sum(buffer_reqs.values())
     return total_buffer_req
 
@@ -1070,8 +1990,8 @@ class ConditionalPerformanceModel(nn.Module):
         total_macs = calculate_macs(layer_info['dims'], layer_info['type'])
         
         # Calculate memory access counts and buffer requirements
-        access_counts = layer_mapping.calculate_access_counts(layer_info['dims'])
-        buffer_requirements = layer_mapping.calculate_buffer_requirements(layer_info['dims'])
+        access_counts = layer_mapping.get_access_counts()
+        buffer_requirements = layer_mapping.get_buffer_requirements()
         
         # === Use modular cost calculation functions ===
         compute_latency = self._calculate_compute_latency(total_macs, hardware_params)
@@ -1099,6 +2019,96 @@ class ConditionalPerformanceModel(nn.Module):
         
         return latency, compute_energy, sram_energy, dram_energy, noc_energy
 
+    def calculate_group_costs(
+        self,
+        group_layers: List[str],
+        template_instance: DifferentiableMappingTemplate,
+        hardware_params: HardwareParameters,
+        graph: ComputationGraph
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        核心成本计算函数：基于映射模板精确计算融合链的成本。
+        
+        严格遵循《Mind the Gap》论文 V-A 至 V-C 节的融合链成本计算逻辑：
+        - 总 Buffer 需求 = max_e(BufReq_e)
+        - 总 DRAM 访问 = Access_W (所有权重) + Access_I,0 (第一个算子输入) + Access_O,E-1 (最后一个算子输出)
+        - 中间张量的 DRAM 读写被完全消除
+        
+        Args:
+            group_layers: 算子组中的层名称列表（可能只有一个层）
+            template_instance: 被指定的映射模板实例
+            hardware_params: 硬件参数
+            graph: 计算图
+            
+        Returns:
+            (total_latency, total_energy): 该组的总延迟和总能耗
+        """
+        config = Config.get_instance()
+        
+        # === 1. 计算总计算量（MACs）===
+        total_macs = torch.tensor(0.0, dtype=torch.float32)
+        for layer_name in group_layers:
+            layer_info = graph.layers[layer_name]
+            layer_macs = calculate_macs(layer_info['dims'], layer_info['type'])
+            total_macs = total_macs + layer_macs
+        
+        # === 2. 计算融合链的缓冲区需求 ===
+        # 模板实例已经为整个组计算了缓冲区需求，直接使用
+        max_buffer_requirements = template_instance.get_buffer_requirements()
+        
+        # === 3. 计算融合链的 DRAM 访问量 ===
+        # 模板实例已经为整个组计算了 DRAM 访问量，直接使用
+        # 这里包含了论文中的逻辑：Access_W (所有权重) + Access_I,0 (第一个算子输入) + Access_O,E-1 (最后一个算子输出)
+        total_dram_accesses = template_instance.get_access_counts()
+        
+        # 如果是多层融合组，需要根据层数调整访问量
+        if len(group_layers) > 1:
+            # 权重访问需要按层数比例调整（每层都有自己的权重）
+            if 'weight' in total_dram_accesses:
+                total_dram_accesses['weight'] = total_dram_accesses['weight'] * len(group_layers)
+            
+            # 输入输出访问保持不变（按融合链逻辑：只有首层输入和末层输出需要DRAM访问）
+        
+        # === 4. 计算延迟 ===
+        # 4.1 计算延迟：基于 roofline 模型
+        compute_latency = self._calculate_compute_latency(total_macs, hardware_params)
+        memory_latency = self._calculate_memory_latency(total_dram_accesses)
+        
+        # 延迟由计算和内存访问的最大值决定
+        total_latency = torch.maximum(compute_latency, memory_latency)
+        
+        # 4.2 如果是融合组（多于一个层），添加融合控制开销
+        if len(group_layers) > 1:
+            fusion_control_overhead = torch.tensor(config.FUSION_LATENCY_PENALTY_CYCLES, dtype=torch.float32)
+            total_latency = total_latency + fusion_control_overhead
+        
+        # === 5. 计算能耗 ===
+        # 5.1 计算能耗：基于各组件的能耗模型
+        compute_energy = self._calculate_compute_energy(total_macs)
+        sram_energy = self._calculate_sram_energy(max_buffer_requirements, hardware_params)
+        dram_energy = self._calculate_dram_energy(total_dram_accesses)
+        
+        # 5.2 计算 NoC 能耗（考虑融合的影响）
+        noc_energy = torch.tensor(0.0, dtype=torch.float32)
+        is_fused = len(group_layers) > 1
+        for layer_name in group_layers:
+            noc_energy = noc_energy + self._calculate_noc_energy(layer_name, graph, is_fused)
+        
+        # 5.3 融合开销能耗
+        fusion_overhead_energy = torch.tensor(0.0, dtype=torch.float32)
+        if is_fused:
+            fusion_overhead_energy = torch.tensor(config.FUSION_OVERHEAD_COST, dtype=torch.float32)
+        
+        # 总能耗
+        total_energy = compute_energy + sram_energy + dram_energy + noc_energy + fusion_overhead_energy
+        
+        # === 6. 数值稳定性检查 ===
+        min_value = 1e-6
+        total_latency = torch.clamp(total_latency, min=min_value)
+        total_energy = torch.clamp(total_energy, min=min_value)
+        
+        return total_latency, total_energy
+
     def forward(
         self,
         mapping_params: MappingParameters,
@@ -1107,151 +2117,123 @@ class ConditionalPerformanceModel(nn.Module):
         graph: ComputationGraph
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Calculate latency, energy, and area costs using analytical models.
-        Uses differentiable weighted-average for fusion decisions with physically accurate
-        DRAM energy savings modeling and learnable hardware parameters.
+        重构后的前向传播：基于映射模板的精确成本计算。
+        
+        新的计算流程：
+        1. 遍历所有融合组和独立层
+        2. 对每个组，获取其 MappingDecisionModule
+        3. 使用模板选择概率进行加权平均
+        4. 为每种模板计算精确成本
+        5. 处理融合开关逻辑
         
         Args:
-            mapping_params: MappingParameters object containing layer mappings
-            fusion_params: FusionParameters object containing fusion decisions
-            hardware_params: HardwareParameters object containing learnable hardware config
-            graph: ComputationGraph object defining the network structure
-        
+            mapping_params: 映射策略管理器
+            fusion_params: 融合参数
+            hardware_params: 硬件参数
+            graph: 计算图
+            
         Returns:
-            total_latency: Total execution latency across all layers
-            total_energy: Total energy consumption across all layers
-            area_cost: Hardware area cost based on learnable hardware parameters
+            (total_latency, total_energy, area_cost): 总延迟、总能耗、芯片面积
         """
         config = Config.get_instance()
         
-        # Get area cost directly from hardware parameters
+        # 获取硬件面积成本
         area_cost = hardware_params.get_area_cost()
         
-        # Initialize total costs
-        total_latency = torch.zeros(1, requires_grad=True)
-        total_energy = torch.zeros(1, requires_grad=True)
+        # 初始化总成本
+        total_latency = torch.tensor(0.0, dtype=torch.float32)
+        total_energy = torch.tensor(0.0, dtype=torch.float32)
         
-        # Create set of layers that are part of any fusion group
-        layers_in_fusion_groups = {
-            layer 
-            for group in graph.fusion_groups 
-            for layer in group
-        }
+        # 获取所有决策模块
+        all_decision_modules = mapping_params.get_all_decision_modules()
+        group_mapping = mapping_params.group_mapping
         
-        # Handle standalone layers (not part of any fusion group)
-        for layer_name in graph.get_layer_names():
-            if layer_name not in layers_in_fusion_groups:
-                # Calculate analytical costs for standalone layer
-                latency, compute_energy, sram_energy, dram_energy, noc_energy = self._calculate_analytical_costs(
-                    layer_name, mapping_params, graph, hardware_params
+        # === 遍历所有计算组（融合组 + 独立层）===
+        for group_key, decision_module in all_decision_modules.items():
+            group_layers = group_mapping[group_key]
+            
+            # === 获取模板选择概率 ===
+            template_probabilities = decision_module.get_template_probabilities()
+            
+            # === 为每种模板计算成本 ===
+            template_costs = []  # [(latency, energy), ...]
+            
+            for i, template_name in enumerate(decision_module.template_names):
+                template_instance = decision_module.get_template_by_name(template_name)
+                
+                # 使用核心成本计算函数
+                template_latency, template_energy = self.calculate_group_costs(
+                    group_layers, template_instance, hardware_params, graph
                 )
-                total_latency = total_latency + latency
-                total_energy = total_energy + compute_energy + sram_energy + dram_energy + noc_energy
+                template_costs.append((template_latency, template_energy))
+            
+            # === 计算该组的期望成本（模板概率加权平均）===
+            group_latency = torch.tensor(0.0, dtype=torch.float32)
+            group_energy = torch.tensor(0.0, dtype=torch.float32)
+            
+            for i, (template_latency, template_energy) in enumerate(template_costs):
+                prob = template_probabilities[i]
+                group_latency = group_latency + prob * template_latency
+                group_energy = group_energy + prob * template_energy
+            
+            # === 处理融合开关逻辑（如果是融合组）===
+            if len(group_layers) > 1:
+                # 这是一个融合组，需要考虑融合概率
+                p_fuse = fusion_params.get_fusion_probability(group_layers)
+                
+                # 计算非融合成本：将组内各层视为独立单元
+                non_fused_latency = torch.tensor(0.0, dtype=torch.float32)
+                non_fused_energy = torch.tensor(0.0, dtype=torch.float32)
+                
+                for layer_name in group_layers:
+                    # 获取该层的决策模块
+                    layer_decision_module = mapping_params.get_decision_module_for_layer(layer_name)
+                    layer_template_probs = layer_decision_module.get_template_probabilities()
+                    
+                    # 计算该层的独立成本
+                    layer_latency = torch.tensor(0.0, dtype=torch.float32)
+                    layer_energy = torch.tensor(0.0, dtype=torch.float32)
+                    
+                    for j, template_name in enumerate(layer_decision_module.template_names):
+                        template_instance = layer_decision_module.get_template_by_name(template_name)
+                        
+                        # 单层成本（作为独立层计算）
+                        template_lat, template_eng = self.calculate_group_costs(
+                            [layer_name], template_instance, hardware_params, graph
+                        )
+                        
+                        prob = layer_template_probs[j]
+                        layer_latency = layer_latency + prob * template_lat
+                        layer_energy = layer_energy + prob * template_eng
+                    
+                    non_fused_latency = non_fused_latency + layer_latency
+                    non_fused_energy = non_fused_energy + layer_energy
+                
+                # 加权平均：融合 vs 非融合
+                final_group_latency = p_fuse * group_latency + (1 - p_fuse) * non_fused_latency
+                final_group_energy = p_fuse * group_energy + (1 - p_fuse) * non_fused_energy
+            else:
+                # 独立层，直接使用计算出的成本
+                final_group_latency = group_latency
+                final_group_energy = group_energy
+            
+            # === 累加到总成本 ===
+            total_latency = total_latency + final_group_latency
+            total_energy = total_energy + final_group_energy
         
-        # Handle fusion groups using differentiable weighted-average with EDP calculation
-        for group in graph.fusion_groups:
-            # Get fusion probability for this group
-            p_fuse = fusion_params.get_fusion_probability(group)
-            
-            # === Calculate Non-Fused Costs (cost_no_fuse) ===
-            non_fused_latency = torch.tensor(0.0)
-            non_fused_energy = torch.tensor(0.0)
-            
-            for layer_name in group:
-                lat, compute_energy, sram_energy, dram_energy, noc_energy = self._calculate_analytical_costs(
-                    layer_name, mapping_params, graph, hardware_params
-                )
-                non_fused_latency = non_fused_latency + lat
-                non_fused_energy = non_fused_energy + compute_energy + sram_energy + dram_energy + noc_energy
-            
-            # Energy-Delay Product for non-fused case
-            cost_no_fuse = non_fused_latency * non_fused_energy
-            
-            # === Calculate Fused Costs (cost_fused) ===
-            fused_latency = torch.tensor(0.0)
-            fused_compute_energy = torch.tensor(0.0)
-            fused_sram_energy = torch.tensor(0.0)
-            fused_dram_energy = torch.tensor(0.0)
-            fused_noc_energy = torch.tensor(0.0)
-            
-            for layer_name in group:
-                lat, compute_energy, sram_energy, dram_energy, noc_energy = self._calculate_analytical_costs(
-                    layer_name, mapping_params, graph, hardware_params, is_fused=True
-                )
-                # Latency is dominated by the slowest path (parallel execution)
-                fused_latency = torch.maximum(fused_latency, lat)
-                fused_compute_energy = fused_compute_energy + compute_energy
-                fused_sram_energy = fused_sram_energy + sram_energy
-                fused_dram_energy = fused_dram_energy + dram_energy
-                fused_noc_energy = fused_noc_energy + noc_energy
-            
-            # === Add fusion control overhead ===
-            # Fusion isn't "free" - there's control overhead for coordinating fused operations
-            fusion_control_overhead = torch.tensor(config.FUSION_LATENCY_PENALTY_CYCLES, dtype=torch.float32)
-            fused_latency = fused_latency + fusion_control_overhead
-            
-            # === MODEL THE DRAM SAVING ===
-            # For fusion groups, intermediate tensors avoid DRAM write + read
-            if len(group) >= 2:
-                # Calculate intermediate tensor size from first layer's output
-                first_layer = group[0]
-                first_layer_dims = graph.layers[first_layer]['dims']
-                
-                # Simplified proxy for output tensor size (elements * bytes_per_element)
-                # Output size = N * K * P * Q for conv layers
-                if 'P' in first_layer_dims and 'Q' in first_layer_dims:
-                    intermediate_tensor_size = torch.tensor(
-                        first_layer_dims['N'] * first_layer_dims.get('K', first_layer_dims.get('C', 1)) * 
-                        first_layer_dims['P'] * first_layer_dims['Q'] * config.BYTES_PER_ELEMENT,
-                        dtype=torch.float32
-                    )
-                else:
-                    # For other layer types, use a simpler calculation
-                    intermediate_tensor_size = torch.tensor(
-                        first_layer_dims['N'] * first_layer_dims.get('K', first_layer_dims.get('C', 1)) * config.BYTES_PER_ELEMENT,
-                        dtype=torch.float32
-                    )
-                
-                # DRAM energy saved = 2 * intermediate_tensor_size * DRAM_ACCESS_COST
-                # (one write to DRAM avoided, one read from DRAM avoided)
-                dram_energy_saved = 2 * intermediate_tensor_size * torch.tensor(config.DRAM_ACCESS_COST, dtype=torch.float32)
-                
-                # Subtract the saving from fused DRAM energy
-                fused_dram_energy = fused_dram_energy - dram_energy_saved
-                
-                # Ensure DRAM energy doesn't go negative
-                fused_dram_energy = torch.maximum(fused_dram_energy, torch.tensor(0.0))
-            
-            # Calculate final fused energy with fusion overhead
-            fused_energy = fused_compute_energy + fused_sram_energy + fused_dram_energy + fused_noc_energy + torch.tensor(config.FUSION_OVERHEAD_COST, dtype=torch.float32)
-            
-            # Energy-Delay Product for fused case
-            cost_fused = fused_latency * fused_energy
-            
-            # === Calculate Weighted-Average EDP for the group ===
-            group_edp = p_fuse * cost_fused + (1 - p_fuse) * cost_no_fuse
-            
-            # Convert back to latency and energy for accumulation
-            # For differentiable accumulation, we use the weighted averages
-            group_latency = p_fuse * fused_latency + (1 - p_fuse) * non_fused_latency
-            group_energy = p_fuse * fused_energy + (1 - p_fuse) * non_fused_energy
-            
-            total_latency = total_latency + group_latency
-            total_energy = total_energy + group_energy
+        # === 数值稳定性检查 ===
+        min_value = 1e-6
+        total_latency = torch.clamp(total_latency, min=min_value)
+        total_energy = torch.clamp(total_energy, min=min_value)
+        area_cost = torch.clamp(area_cost, min=min_value)
         
-        # --- FIX: Add numerical stability assertions to detect inf/NaN early ---
-        # These assertions will help us quickly identify where numerical problems originate
+        # 断言检查
         assert not torch.isinf(total_latency), f"Latency exploded to infinity! Value: {total_latency}"
         assert not torch.isnan(total_latency), f"Latency became NaN! This indicates numerical instability."
         assert not torch.isinf(total_energy), f"Energy exploded to infinity! Value: {total_energy}"
         assert not torch.isnan(total_energy), f"Energy became NaN! This indicates numerical instability."
         assert not torch.isinf(area_cost), f"Area cost exploded to infinity! Value: {area_cost}"
         assert not torch.isnan(area_cost), f"Area cost became NaN! This indicates numerical instability."
-        
-        # Additional safety checks for physically reasonable values
-        assert total_latency > 0, f"Latency must be positive! Got: {total_latency}"
-        assert total_energy > 0, f"Energy must be positive! Got: {total_energy}"
-        assert area_cost > 0, f"Area cost must be positive! Got: {area_cost}"
         
         return total_latency, total_energy, area_cost
 
@@ -1356,36 +2338,44 @@ def calculate_total_loss_with_hardware_constraints(
     graph: ComputationGraph
 ) -> torch.Tensor:
     """
-    Calculate total loss including performance objectives and hardware constraints.
+    重构后的总损失函数：使用基于模板的约束。
     
     Args:
-        performance_model: ConditionalPerformanceModel instance
-        mapping_params: MappingParameters object
-        fusion_params: FusionParameters object
-        hardware_params: HardwareParameters object
-        graph: ComputationGraph object
+        performance_model: 重构后的 ConditionalPerformanceModel 实例
+        mapping_params: 映射策略管理器
+        fusion_params: 融合参数
+        hardware_params: 硬件参数
+        graph: 计算图
         
     Returns:
-        Total loss tensor for optimization
+        用于优化的总损失张量
     """
     config = Config.get_instance()
     
-    # Calculate performance metrics
+    # 使用重构后的性能模型计算性能指标
     latency, energy, area = performance_model(mapping_params, fusion_params, hardware_params, graph)
     
-    # Calculate penalties
-    mapping_penalty = calculate_penalty_loss(mapping_params)
-    product_penalty = calculate_product_constraint_penalty(mapping_params, graph)
-    hardware_penalty = calculate_hardware_constraint_penalty(mapping_params, hardware_params, graph)
+    # 计算新的基于模板的约束惩罚
+    mapping_penalty = calculate_penalty_loss(mapping_params)  # 重构后的函数
+    template_constraint_penalty = calculate_template_constraint_penalty(mapping_params, hardware_params, graph)  # 新的约束函数
     
-    # Combine all components with weights
+    # 移除旧的 product_penalty 和 hardware_penalty，因为它们已被新的模板约束函数取代
+    # product_penalty = calculate_product_constraint_penalty(mapping_params, graph)  # 已废弃
+    # hardware_penalty = calculate_hardware_constraint_penalty(mapping_params, hardware_params, graph)  # 已废弃
+    
+    # 使用对数域进行数值稳定的损失计算
+    epsilon = 1e-9
+    log_latency = torch.log(latency + epsilon)
+    log_energy = torch.log(energy + epsilon)
+    log_area = torch.log(area + epsilon)
+    
+    # 组合所有组件并加权
     total_loss = (
-        config.LATENCY_WEIGHT * latency + 
-        config.ENERGY_WEIGHT * energy + 
-        config.AREA_WEIGHT * area +
+        config.LATENCY_WEIGHT * log_latency + 
+        config.ENERGY_WEIGHT * log_energy + 
+        config.AREA_WEIGHT * log_area +
         config.PENALTY_WEIGHT * mapping_penalty +
-        config.PRODUCT_PENALTY_WEIGHT * product_penalty +
-        config.PENALTY_WEIGHT * hardware_penalty  # Use same weight as mapping penalty
+        config.PENALTY_WEIGHT * template_constraint_penalty  # 新的模板约束惩罚
     )
     
     return total_loss
