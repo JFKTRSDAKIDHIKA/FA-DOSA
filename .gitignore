@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ONNX Models
+*.onnx
+
+# CSV files
+*.csv
+
+# Saved Parameters
+saved_parameters/
+*.pth
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/ 
