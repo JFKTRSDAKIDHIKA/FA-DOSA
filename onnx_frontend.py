@@ -49,7 +49,7 @@ def extract_attribute_value(attributes, attr_name, default=None):
 def extract_dims_from_shape(output_shape, op_type):
     """
     Extract FA-DOSA dimensions from ONNX tensor shape based on operation type.
-    Enhanced for comprehensive operator support.
+    Enhanced for comprehensive operator support including Transformers.
     
     Args:
         output_shape: ONNX tensor shape dimensions
@@ -61,11 +61,16 @@ def extract_dims_from_shape(output_shape, op_type):
     layer_dims = {}
     
     # Handle different tensor ranks
-    if len(output_shape.dim) == 4:  # Standard NCHW format
+    if len(output_shape.dim) == 4:  # Standard NCHW format (CNNs)
         layer_dims['N'] = safe_get_dim_value(output_shape.dim[0], 1)
         layer_dims['K'] = safe_get_dim_value(output_shape.dim[1])
         layer_dims['P'] = safe_get_dim_value(output_shape.dim[2])
         layer_dims['Q'] = safe_get_dim_value(output_shape.dim[3])
+    elif len(output_shape.dim) == 3:  # Transformer format (N, SeqLen, Features)
+        layer_dims['N'] = safe_get_dim_value(output_shape.dim[0], 1)  # Batch size
+        layer_dims['P'] = safe_get_dim_value(output_shape.dim[1], 512)  # Sequence length -> P
+        layer_dims['K'] = safe_get_dim_value(output_shape.dim[2], 768)  # Hidden features -> K 
+        layer_dims['Q'] = 1  # Not used in Transformers, set to 1
     elif len(output_shape.dim) == 2:  # After flatten/fully connected
         layer_dims['N'] = safe_get_dim_value(output_shape.dim[0], 1)
         layer_dims['K'] = safe_get_dim_value(output_shape.dim[1])
@@ -79,8 +84,8 @@ def extract_dims_from_shape(output_shape, op_type):
     else:
         # Fallback for other ranks
         layer_dims['N'] = 1
-        layer_dims['K'] = 64  # Default channel count
-        layer_dims['P'] = 1
+        layer_dims['K'] = 768  # Default Transformer hidden size
+        layer_dims['P'] = 512  # Default sequence length
         layer_dims['Q'] = 1
     
     return layer_dims
@@ -142,6 +147,76 @@ def parse_onnx_to_graph(onnx_model_path: str) -> ComputationGraph:
                 layer_dims['R'] = 1
                 layer_dims['S'] = 1
                 
+            # === TRANSFORMER-SPECIFIC OPERATORS ===
+            
+            elif node.op_type == 'LayerNormalization':
+                # Layer normalization - common in Transformers
+                # Preserves input shape, normalizes along last dimension
+                layer_dims['C'] = layer_dims['K']  # Input features = output features
+                layer_dims['R'] = 1  # No spatial kernel
+                layer_dims['S'] = 1
+                # For 3D tensors: (N, SeqLen, Features) -> (N, SeqLen, Features)
+                print(f"    LayerNorm: N={layer_dims['N']}, SeqLen={layer_dims['P']}, Features={layer_dims['K']}")
+                
+            elif node.op_type in ['Gelu', 'Erf']:
+                # GELU and related activations common in Transformers
+                # Element-wise operations that preserve tensor shape
+                layer_dims['C'] = layer_dims['K']
+                layer_dims['R'] = 1
+                layer_dims['S'] = 1
+                print(f"    {node.op_type}: Element-wise activation preserving shape")
+                
+            elif node.op_type in ['Gemm', 'MatMul']:
+                # Matrix multiplication - core of self-attention and feed-forward networks
+                layer_dims['P'] = layer_dims.get('P', 1)  # Preserve sequence length if present
+                layer_dims['Q'] = 1
+                layer_dims['R'] = 1
+                layer_dims['S'] = 1
+                
+                # Extract input/output dimensions from weight tensor
+                if len(node.input) > 1 and node.input[1] in initializers:
+                    weight_tensor = initializers[node.input[1]]
+                    if len(weight_tensor.dims) >= 2:
+                        layer_dims['C'] = weight_tensor.dims[0]  # Input features
+                        # K (output features) is already set from output shape
+                        print(f"    MatMul: {layer_dims['C']} -> {layer_dims['K']} (SeqLen={layer_dims['P']})")
+                elif len(node.input) >= 2 and node.input[0] in tensor_shapes and node.input[1] in tensor_shapes:
+                    # Try to infer from input tensor shapes
+                    input1_shape = tensor_shapes[node.input[0]].type.tensor_type.shape
+                    input2_shape = tensor_shapes[node.input[1]].type.tensor_type.shape
+                    if len(input1_shape.dim) >= 2 and len(input2_shape.dim) >= 2:
+                        # For MatMul: (N, SeqLen, C) × (C, K) -> (N, SeqLen, K)
+                        layer_dims['C'] = safe_get_dim_value(input1_shape.dim[-1], layer_dims['K'])
+                        print(f"    MatMul: Inferred {layer_dims['C']} -> {layer_dims['K']}")
+                else:
+                    layer_dims['C'] = layer_dims['K']  # Fallback
+                    print(f"    MatMul: Using fallback dimensions")
+                    
+            elif node.op_type == 'Softmax':
+                # Softmax - common in attention mechanisms
+                # Preserves input shape, normalizes along specified axis
+                layer_dims['C'] = layer_dims['K']
+                layer_dims['R'] = 1
+                layer_dims['S'] = 1
+                print(f"    Softmax: Attention normalization preserving shape")
+                
+            elif node.op_type in ['Transpose', 'Reshape', 'Squeeze', 'Unsqueeze']:
+                # Tensor manipulation operations common in Transformers
+                layer_dims['C'] = layer_dims['K']
+                layer_dims['R'] = 1
+                layer_dims['S'] = 1
+                # Note: These operations may change tensor rank, but we handle that in shape extraction
+                
+            elif node.op_type == 'Attention':
+                # Multi-head attention operator (if present as fused op)
+                # Complex operator with multiple internal matrix multiplications
+                layer_dims['C'] = layer_dims['K']  # Typically C = K for self-attention
+                layer_dims['R'] = 1
+                layer_dims['S'] = 1
+                print(f"    Attention: Self-attention with {layer_dims['K']} features")
+                
+            # === CNN-SPECIFIC OPERATORS (EXISTING) ===
+                
             elif node.op_type == 'BatchNormalization':
                 # BatchNorm - infer dimensions from output shape (same as input)
                 layer_dims['C'] = layer_dims['K']  # Input channels = output channels
@@ -157,7 +232,7 @@ def parse_onnx_to_graph(onnx_model_path: str) -> ComputationGraph:
                 layer_dims['S'] = kernel_shape[1] if len(kernel_shape) >= 2 else 2
                 
             elif node.op_type == 'Add':
-                # Element-wise addition - crucial for residual connections
+                # Element-wise addition - crucial for residual connections (both CNN and Transformer)
                 # Add has two inputs, infer dimensions from output shape
                 layer_dims['C'] = layer_dims['K']
                 layer_dims['R'] = 1  # Element-wise operation
@@ -174,27 +249,11 @@ def parse_onnx_to_graph(onnx_model_path: str) -> ComputationGraph:
             elif node.op_type in ['Flatten', 'Reshape']:
                 # Flattening operations - reshape tensor
                 layer_dims['C'] = layer_dims['K']  # May be overridden below
-                layer_dims['P'] = 1
+                layer_dims['P'] = layer_dims.get('P', 1)  # Preserve if present
                 layer_dims['Q'] = 1
                 layer_dims['R'] = 1
                 layer_dims['S'] = 1
                 
-            elif node.op_type in ['Gemm', 'MatMul']:
-                # Fully connected layers - matrix multiplication
-                layer_dims['P'] = 1
-                layer_dims['Q'] = 1
-                layer_dims['R'] = 1
-                layer_dims['S'] = 1
-                
-                # Try to get input dimension from weights
-                if len(node.input) > 1 and node.input[1] in initializers:
-                    weight_tensor = initializers[node.input[1]]
-                    if len(weight_tensor.dims) >= 2:
-                        layer_dims['C'] = weight_tensor.dims[0]  # Input features
-                        # K is already set from output shape
-                else:
-                    layer_dims['C'] = layer_dims['K']  # Fallback
-                    
             elif node.op_type in ['AveragePool', 'LpPool']:
                 # Other pooling operations
                 layer_dims['C'] = layer_dims['K']
@@ -222,8 +281,8 @@ def parse_onnx_to_graph(onnx_model_path: str) -> ComputationGraph:
                 
             else:
                 # Default case for unsupported operations - robust fallback
-                print(f"Warning: Unsupported op_type '{node.op_type}' at node '{node.name}'. Preserving connectivity only.")
-                layer_dims['C'] = layer_dims.get('K', 64)
+                print(f"Warning: Unsupported op_type '{node.op_type}' at node '{node.name}'. Using default dimensions.")
+                layer_dims['C'] = layer_dims.get('K', 768)  # Default to Transformer hidden size
                 # Set default values for missing dimensions
                 for dim in ['R', 'S']:
                     if dim not in layer_dims:
@@ -258,6 +317,8 @@ def parse_onnx_to_graph(onnx_model_path: str) -> ComputationGraph:
     print("\nDetecting fusion patterns...")
     fusion_count = 0
     
+    # === CNN FUSION PATTERNS ===
+    
     # Pattern 1: Conv -> BatchNorm -> ReLU (ResNet-specific)
     for node in graph.node:
         if node.op_type == 'Conv':
@@ -286,7 +347,7 @@ def parse_onnx_to_graph(onnx_model_path: str) -> ComputationGraph:
                             break
                     break
     
-    # Pattern 2: Conv -> ReLU (simpler cases)
+    # Pattern 2: Conv -> ReLU (simpler CNN cases)
     for node in graph.node:
         if node.op_type == 'Conv':
             conv_name = node.name
@@ -309,6 +370,99 @@ def parse_onnx_to_graph(onnx_model_path: str) -> ComputationGraph:
                         print(f"  Found Conv->ReLU pattern: {' -> '.join(fusion_group)}")
                         fusion_count += 1
                         break
+    
+    # === TRANSFORMER FUSION PATTERNS ===
+    
+    # Pattern 3: MatMul -> Add (Feed-forward network or attention projection)
+    for node in graph.node:
+        if node.op_type in ['MatMul', 'Gemm']:
+            matmul_name = node.name
+            matmul_consumers = graph_nodes.get_node_consumers(matmul_name)
+            
+            # Check for Add operation (bias addition or residual connection)
+            for add_candidate in matmul_consumers:
+                if (add_candidate in node_dict and 
+                    node_dict[add_candidate].op_type == 'Add' and
+                    len(matmul_consumers) == 1):  # Ensure linear chain
+                    
+                    fusion_group = [matmul_name, add_candidate]
+                    graph_nodes.add_fusion_group(fusion_group)
+                    print(f"  Found MatMul->Add pattern: {' -> '.join(fusion_group)}")
+                    fusion_count += 1
+                    break
+    
+    # Pattern 4: LayerNorm -> MatMul (Common in Transformer blocks)
+    for node in graph.node:
+        if node.op_type == 'LayerNormalization':
+            layernorm_name = node.name
+            layernorm_consumers = graph_nodes.get_node_consumers(layernorm_name)
+            
+            # Check for MatMul operation (attention or feed-forward)
+            for matmul_candidate in layernorm_consumers:
+                if (matmul_candidate in node_dict and 
+                    node_dict[matmul_candidate].op_type in ['MatMul', 'Gemm'] and
+                    len(layernorm_consumers) == 1):  # Ensure linear chain
+                    
+                    fusion_group = [layernorm_name, matmul_candidate]
+                    graph_nodes.add_fusion_group(fusion_group)
+                    print(f"  Found LayerNorm->MatMul pattern: {' -> '.join(fusion_group)}")
+                    fusion_count += 1
+                    break
+    
+    # Pattern 5: MatMul -> Gelu (Feed-forward activation in Transformers)
+    for node in graph.node:
+        if node.op_type in ['MatMul', 'Gemm']:
+            matmul_name = node.name
+            matmul_consumers = graph_nodes.get_node_consumers(matmul_name)
+            
+            # Avoid double-counting if already in MatMul->Add pattern
+            already_in_matmul_fusion = any(
+                matmul_name in group and len(group) >= 2
+                for group in graph_nodes.fusion_groups
+            )
+            
+            if not already_in_matmul_fusion:
+                for gelu_candidate in matmul_consumers:
+                    if (gelu_candidate in node_dict and 
+                        node_dict[gelu_candidate].op_type in ['Gelu', 'Relu'] and
+                        len(matmul_consumers) == 1):  # Ensure linear chain
+                        
+                        fusion_group = [matmul_name, gelu_candidate]
+                        graph_nodes.add_fusion_group(fusion_group)
+                        print(f"  Found MatMul->Gelu pattern: {' -> '.join(fusion_group)}")
+                        fusion_count += 1
+                        break
+    
+    # Pattern 6: Three-op Transformer pattern: LayerNorm -> MatMul -> Add
+    for node in graph.node:
+        if node.op_type == 'LayerNormalization':
+            layernorm_name = node.name
+            layernorm_consumers = graph_nodes.get_node_consumers(layernorm_name)
+            
+            for matmul_candidate in layernorm_consumers:
+                if (matmul_candidate in node_dict and 
+                    node_dict[matmul_candidate].op_type in ['MatMul', 'Gemm']):
+                    
+                    matmul_consumers = graph_nodes.get_node_consumers(matmul_candidate)
+                    
+                    for add_candidate in matmul_consumers:
+                        if (add_candidate in node_dict and 
+                            node_dict[add_candidate].op_type == 'Add' and
+                            len(layernorm_consumers) == 1 and len(matmul_consumers) == 1):
+                            
+                            # Check if this would create a longer chain than existing patterns
+                            existing_short_patterns = [
+                                group for group in graph_nodes.fusion_groups 
+                                if layernorm_name in group or matmul_candidate in group
+                            ]
+                            
+                            if not existing_short_patterns:
+                                fusion_group = [layernorm_name, matmul_candidate, add_candidate]
+                                graph_nodes.add_fusion_group(fusion_group)
+                                print(f"  Found LayerNorm->MatMul->Add pattern: {' -> '.join(fusion_group)}")
+                                fusion_count += 1
+                            break
+                    break
     
     print(f"  Detected {fusion_count} fusion opportunities")
     print(f"\nParsing complete: {len(graph_nodes.layers)} layers, {len(graph_nodes.edges)} edges, {len(graph_nodes.fusion_groups)} fusion groups")
