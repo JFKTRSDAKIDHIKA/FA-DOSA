@@ -22,10 +22,58 @@ costs:
   # Energy scaling
   sram_energy_scaling_pj_byte_kb: 0.0001  # Energy increase per KB of buffer size
 
-# Loss function weights
+# === NEW: Physics-aware loss function weights ===
+# These weights control how much the optimizer cares about different physical costs
 weights:
-  penalty_weight: 1.0       # Weight for tiling factor < 1 penalty
-  product_penalty_weight: 500.0  # Weight for product constraint penalty
+  # Performance and area weights
+  latency_weight: 1.5              # Increased by 1.5x for stronger EDP focus
+  area_weight: 0.0                 # Set to zero to ignore area cost
+  
+  # === ENERGY WEIGHTS: Now decomposed by physical cost ===
+  # These separate weights allow fine-grained control over optimization priorities
+  compute_energy_weight: 0.75      # MAC operations are relatively cheap (1.5x)
+  sram_energy_weight: 3.0          # On-chip SRAM access has moderate cost (1.5x)
+  dram_energy_weight: 30.0         # 🔥 CRITICAL: High weight punishes expensive DRAM access (1.5x)
+  noc_energy_weight: 2.25          # Network-on-chip communication cost (1.5x)
+  
+  # Constraint violation penalties
+  penalty_weight: 500.0            # Penalty for invalid tiling factors (< 1)
+
+# === NEW: Calibration factors for model tuning ===
+calibration:
+  latency_fudge_factor: 1.2        # Accounts for pipeline stalls, cache misses
+  dram_energy_factor: 1.1          # Calibrate against real DRAM measurements
+  sram_energy_factor: 0.9          # Fine-tune SRAM energy model
+  compute_energy_factor: 1.0       # MAC operation energy calibration
+  noc_energy_factor: 1.15          # Network-on-Chip energy adjustment
+
+# === NEW: NoC (Network-on-Chip) energy parameters ===
+noc:
+  noc_energy_per_byte_pj: 0.05     # Energy cost per byte moved on NoC
+
+# === NEW: Fusion control overhead parameters ===
+fusion:
+  fusion_control_overhead_cycles: 50  # Control overhead for coordinating fused ops
+  fusion_latency_penalty_cycles: 30   # Extra cycles added per fused group
+  # Dynamic fusion overhead scaling factors
+  tiling_complexity_weight: 0.5       # How much tiling complexity affects fusion overhead
+  fusion_energy_base_scaling: 0.4     # Base scaling for energy overhead from tiling
+  data_management_energy_per_layer: 0.1  # Energy per layer for managing fused data
+
+# === NEW: Compute energy parameters ===
+compute:
+  mac_energy_pj: 0.1               # Energy per MAC operation in picojoules
+
+# === NEW: Hardware Design Space Exploration parameters ===
+hardware_dse:
+  clock_frequency_mhz: 1000.0      # Clock frequency in MHz
+  macs_per_pe_per_cycle: 1.0       # MAC operations per PE per clock cycle
+
+# === NEW: Area model coefficients ===
+area_model:
+  area_per_pe_mm2: 0.01            # Area per processing element in mm²
+  area_per_kb_sram_mm2: 0.1        # Area per KB of SRAM in mm²
+  area_base_mm2: 1.0               # Base area for control logic in mm²
 
 # Problem dimensions
 dimensions:

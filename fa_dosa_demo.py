@@ -143,7 +143,7 @@ class Config:
         
         # Loss weights
         self.PENALTY_WEIGHT = self._config['weights']['penalty_weight']
-        self.PRODUCT_PENALTY_WEIGHT = self._config['weights']['product_penalty_weight']
+        self.PRODUCT_PENALTY_WEIGHT = self._config['weights'].get('product_penalty_weight', 1.0)
         
         # === NEW: Calibration factors for model tuning ===
         calibration = self._config.get('calibration', {})
@@ -2024,10 +2024,14 @@ class ConditionalPerformanceModel(nn.Module):
         group_layers: List[str],
         template_instance: DifferentiableMappingTemplate,
         hardware_params: HardwareParameters,
-        graph: ComputationGraph
+        graph: ComputationGraph,
+        is_fusion_calculation: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         核心成本计算函数：基于映射模板精确计算融合链的成本。
+        
+        ENHANCED FOR MAPPING-FUSION SYNERGY: 当用于融合成本计算时，
+        融合开销会根据映射模板的Tiling因子动态调整，实现真正的协同优化。
         
         严格遵循《Mind the Gap》论文 V-A 至 V-C 节的融合链成本计算逻辑：
         - 总 Buffer 需求 = max_e(BufReq_e)
@@ -2039,6 +2043,7 @@ class ConditionalPerformanceModel(nn.Module):
             template_instance: 被指定的映射模板实例
             hardware_params: 硬件参数
             graph: 计算图
+            is_fusion_calculation: 如果为True，表示这是为融合组计算成本，会应用动态融合开销
             
         Returns:
             (total_latency, total_energy): 该组的总延迟和总能耗
@@ -2077,8 +2082,50 @@ class ConditionalPerformanceModel(nn.Module):
         # 延迟由计算和内存访问的最大值决定
         total_latency = torch.maximum(compute_latency, memory_latency)
         
-        # 4.2 如果是融合组（多于一个层），添加融合控制开销
-        if len(group_layers) > 1:
+        # 4.2 动态融合控制开销（NEW: 基于映射策略的协同优化）
+        if len(group_layers) > 1 and is_fusion_calculation:
+            # === 提取映射模板的Tiling因子 ===
+            tiling_complexity_factor = torch.tensor(1.0, dtype=torch.float32)
+            
+            # 根据不同模板类型提取相关的Tiling因子
+            if hasattr(template_instance, 'get_M0') and hasattr(template_instance, 'get_K0'):
+                try:
+                    M0 = template_instance.get_M0()
+                    K0 = template_instance.get_K0() if hasattr(template_instance, 'get_K0') else torch.tensor(1.0)
+                    N0 = template_instance.get_N0() if hasattr(template_instance, 'get_N0') else torch.tensor(1.0)
+                    
+                    # 计算Tiling复杂度：较大的Tiling因子意味着更复杂的数据调度
+                    # 使用几何平均来平衡各维度的影响
+                    tiling_complexity_factor = torch.pow(M0 * K0 * N0, 1.0/3.0)
+                    
+                    # 归一化到合理范围 [1.0, 5.0]，避免过度惩罚
+                    tiling_complexity_factor = torch.clamp(
+                        1.0 + torch.log(tiling_complexity_factor + 1e-6), 
+                        min=1.0, 
+                        max=5.0
+                    )
+                    
+                except Exception as e:
+                    # 如果提取失败，使用默认值
+                    tiling_complexity_factor = torch.tensor(1.5, dtype=torch.float32)
+            
+            # === 计算动态融合开销 ===
+            # 基础开销
+            base_fusion_overhead = torch.tensor(config.FUSION_LATENCY_PENALTY_CYCLES, dtype=torch.float32)
+            
+            # 映射复杂度相关的开销：复杂的映射需要更多的融合协调时间
+            mapping_dependent_overhead = base_fusion_overhead * (tiling_complexity_factor - 1.0) * 0.5
+            
+            # 层数相关的开销：更多层的融合需要更复杂的控制
+            layer_count_overhead = torch.tensor(10.0 * (len(group_layers) - 1), dtype=torch.float32)
+            
+            # 总融合控制开销
+            total_fusion_overhead = base_fusion_overhead + mapping_dependent_overhead + layer_count_overhead
+            
+            total_latency = total_latency + total_fusion_overhead
+            
+        elif len(group_layers) > 1:
+            # 非融合计算时的静态开销（兼容性保持）
             fusion_control_overhead = torch.tensor(config.FUSION_LATENCY_PENALTY_CYCLES, dtype=torch.float32)
             total_latency = total_latency + fusion_control_overhead
         
@@ -2094,9 +2141,43 @@ class ConditionalPerformanceModel(nn.Module):
         for layer_name in group_layers:
             noc_energy = noc_energy + self._calculate_noc_energy(layer_name, graph, is_fused)
         
-        # 5.3 融合开销能耗
+        # 5.3 动态融合开销能耗（NEW: 基于映射策略的协同优化）
         fusion_overhead_energy = torch.tensor(0.0, dtype=torch.float32)
-        if is_fused:
+        if is_fused and is_fusion_calculation:
+            # === 提取映射模板的Tiling因子（能耗版本）===
+            tiling_complexity_factor = torch.tensor(1.0, dtype=torch.float32)
+            
+            if hasattr(template_instance, 'get_M0') and hasattr(template_instance, 'get_K0'):
+                try:
+                    M0 = template_instance.get_M0()
+                    K0 = template_instance.get_K0() if hasattr(template_instance, 'get_K0') else torch.tensor(1.0)
+                    N0 = template_instance.get_N0() if hasattr(template_instance, 'get_N0') else torch.tensor(1.0)
+                    
+                    # 能耗的复杂度因子：考虑缓冲区管理和数据移动的复杂性
+                    buffer_complexity = torch.sqrt(M0 * K0 * N0)
+                    tiling_complexity_factor = torch.clamp(
+                        1.0 + torch.log(buffer_complexity + 1e-6) * 0.3,  # 更温和的增长
+                        min=1.0, 
+                        max=3.0
+                    )
+                    
+                except Exception as e:
+                    tiling_complexity_factor = torch.tensor(1.2, dtype=torch.float32)
+            
+            # === 计算动态融合能耗开销 ===
+            # 基础融合能耗开销
+            base_fusion_energy = torch.tensor(config.FUSION_OVERHEAD_COST, dtype=torch.float32)
+            
+            # 映射复杂度相关的能耗：复杂映射增加控制电路和缓冲管理的能耗
+            mapping_dependent_energy = base_fusion_energy * (tiling_complexity_factor - 1.0) * 0.4
+            
+            # 数据量相关的额外开销：大Tiling因子意味着更多的中间数据管理
+            data_management_energy = torch.tensor(0.1, dtype=torch.float32) * tiling_complexity_factor * len(group_layers)
+            
+            fusion_overhead_energy = base_fusion_energy + mapping_dependent_energy + data_management_energy
+            
+        elif is_fused:
+            # 静态融合能耗开销（兼容性保持）
             fusion_overhead_energy = torch.tensor(config.FUSION_OVERHEAD_COST, dtype=torch.float32)
         
         # 总能耗
@@ -2163,7 +2244,8 @@ class ConditionalPerformanceModel(nn.Module):
                 
                 # 使用核心成本计算函数
                 template_latency, template_energy = self.calculate_group_costs(
-                    group_layers, template_instance, hardware_params, graph
+                    group_layers, template_instance, hardware_params, graph,
+                    is_fusion_calculation=False  # 初始计算不启用动态融合开销
                 )
                 template_costs.append((template_latency, template_energy))
             
@@ -2181,6 +2263,25 @@ class ConditionalPerformanceModel(nn.Module):
                 # 这是一个融合组，需要考虑融合概率
                 p_fuse = fusion_params.get_fusion_probability(group_layers)
                 
+                # === ENHANCED: 为融合组重新计算成本，使用动态融合开销 ===
+                # 重新计算融合成本，但这次明确标记为融合计算，启用动态开销
+                fused_latency = torch.tensor(0.0, dtype=torch.float32)
+                fused_energy = torch.tensor(0.0, dtype=torch.float32)
+                
+                for i, (template_latency, template_energy) in enumerate(template_costs):
+                    # 获取对应的模板实例
+                    template_instance = decision_module.get_template_by_name(decision_module.template_names[i])
+                    
+                    # 使用动态融合开销重新计算成本
+                    fusion_aware_latency, fusion_aware_energy = self.calculate_group_costs(
+                        group_layers, template_instance, hardware_params, graph, 
+                        is_fusion_calculation=True  # 启用动态融合开销
+                    )
+                    
+                    prob = template_probabilities[i]
+                    fused_latency = fused_latency + prob * fusion_aware_latency
+                    fused_energy = fused_energy + prob * fusion_aware_energy
+                
                 # 计算非融合成本：将组内各层视为独立单元
                 non_fused_latency = torch.tensor(0.0, dtype=torch.float32)
                 non_fused_energy = torch.tensor(0.0, dtype=torch.float32)
@@ -2197,9 +2298,10 @@ class ConditionalPerformanceModel(nn.Module):
                     for j, template_name in enumerate(layer_decision_module.template_names):
                         template_instance = layer_decision_module.get_template_by_name(template_name)
                         
-                        # 单层成本（作为独立层计算）
+                        # 单层成本（作为独立层计算，不启用动态融合开销）
                         template_lat, template_eng = self.calculate_group_costs(
-                            [layer_name], template_instance, hardware_params, graph
+                            [layer_name], template_instance, hardware_params, graph,
+                            is_fusion_calculation=False  # 不启用动态融合开销
                         )
                         
                         prob = layer_template_probs[j]
@@ -2209,9 +2311,10 @@ class ConditionalPerformanceModel(nn.Module):
                     non_fused_latency = non_fused_latency + layer_latency
                     non_fused_energy = non_fused_energy + layer_energy
                 
-                # 加权平均：融合 vs 非融合
-                final_group_latency = p_fuse * group_latency + (1 - p_fuse) * non_fused_latency
-                final_group_energy = p_fuse * group_energy + (1 - p_fuse) * non_fused_energy
+                # === CRITICAL: 基于专门为融合组优化的映射模板进行融合决策 ===
+                # 这是协同优化的核心：融合决策现在基于为该融合组特别优化的映射策略
+                final_group_latency = p_fuse * fused_latency + (1 - p_fuse) * non_fused_latency
+                final_group_energy = p_fuse * fused_energy + (1 - p_fuse) * non_fused_energy
             else:
                 # 独立层，直接使用计算出的成本
                 final_group_latency = group_latency

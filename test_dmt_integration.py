@@ -98,11 +98,18 @@ def test_performance_model():
     
     model = ConditionalPerformanceModel()
     
-    # 前向传播
-    latency, energy, area = model(mapping_params, fusion_params, hardware_params, graph)
+    # 前向传播 (新的6值返回签名)
+    latency, compute_energy, sram_energy, dram_energy, noc_energy, area = model(mapping_params, fusion_params, hardware_params, graph)
+    
+    # 计算总能耗以保持兼容性
+    total_energy = compute_energy + sram_energy + dram_energy + noc_energy
     
     print(f"延迟: {latency.item():.6f}")
-    print(f"能耗: {energy.item():.6f}")
+    print(f"总能耗: {total_energy.item():.6f}")
+    print(f"  计算能耗: {compute_energy.item():.6f}")
+    print(f"  SRAM能耗: {sram_energy.item():.6f}")
+    print(f"  DRAM能耗: {dram_energy.item():.6f}")
+    print(f"  NoC能耗: {noc_energy.item():.6f}")
     print(f"面积: {area.item():.6f}")
     
     # 检查梯度

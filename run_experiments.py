@@ -21,6 +21,8 @@ demonstrating FA-DOSA's joint optimization advantages across diverse AI workload
 
 import csv
 import os
+import json
+import re
 from typing import Dict, List
 import torch
 import torch.optim as optim
@@ -28,24 +30,20 @@ import time
 import numpy as np
 import random
 import torch.nn as nn
+import yaml
 
 from fa_dosa_demo import (
-    ConditionalPerformanceModel,
     HardwareParameters,
     MappingParameters,
     FusionParameters,
     Config,
-    ComputationGraph,  # <-- FIX: Import the correct graph class
-    # --- UPDATED: Import new template-based constraint functions ---
-    calculate_penalty_loss,
-    calculate_template_constraint_penalty,  # 新的模板约束函数
-    # 移除已废弃的约束函数：
-    # calculate_product_constraint_penalty,  # 已被 calculate_template_constraint_penalty 取代
-    # calculate_hardware_constraint_penalty,  # 已被 calculate_template_constraint_penalty 取代
-    create_example_optimization_setup,
-    create_joint_optimizer,
+    ComputationGraph,
+    ConditionalPerformanceModel,
     calculate_total_loss_with_hardware_constraints,
-    calculate_fused_group_buffer_req
+    create_example_optimization_setup,
+    calculate_penalty_loss,
+    calculate_template_constraint_penalty,
+    calculate_fused_group_buffer_req,
 )
 from onnx_frontend import parse_onnx_to_graph
 
@@ -53,6 +51,261 @@ from onnx_frontend import parse_onnx_to_graph
 # ==============================================================================
 # UNIFIED FINAL PERFORMANCE EVALUATION FUNCTION
 # ==============================================================================
+
+def log_final_configuration(
+    algo_name: str,
+    workload: str,
+    trial_num: int,
+    hardware_params: HardwareParameters,
+    mapping_params: MappingParameters,
+    fusion_params: FusionParameters,
+    final_metrics: Dict
+) -> None:
+    """
+    生成详细的最终配置报告，用于后续的外部工具验证（如Timeloop）。
+    
+    Args:
+        algo_name: 算法名称
+        workload: 工作负载名称
+        trial_num: 试验编号
+        hardware_params: 最终硬件参数
+        mapping_params: 最终映射参数
+        fusion_params: 最终融合参数
+        final_metrics: 最终性能指标
+    """
+    print("\n🔍 Generating configuration report for {}...".format(algo_name))
+    print("=" * 80)
+    print(f"FINAL CONFIGURATION REPORT")
+    print(f"Algorithm: {algo_name}")
+    print(f"Workload: {workload}")
+    print(f"Trial: {trial_num}")
+    print("=" * 80)
+    
+    # === 硬件配置部分 ===
+    print(f"\n📊 HARDWARE CONFIGURATION:")
+    print(f"  Processing Elements: {hardware_params.get_num_pes().item():.0f}")
+    print(f"  Buffer Size (KB): {hardware_params.get_buffer_size_kb().item():.2f}")
+    print(f"  Buffer Size (Bytes): {hardware_params.get_buffer_size_bytes().item():.0f}")
+    print(f"  Total Area (mm²): {hardware_params.get_area_cost().item():.4f}")
+    
+    # === 映射策略配置部分 ===
+    print(f"\n🗺️  MAPPING CONFIGURATION:")
+    try:
+        decision_modules = mapping_params.get_all_decision_modules()
+        for group_key, decision_module in decision_modules.items():
+            print(f"  Group: {group_key}")
+            
+            # 显示模板选择概率
+            template_probs = decision_module.get_template_probabilities()
+            for i, template_name in enumerate(decision_module.template_names):
+                prob = template_probs[i].item()
+                print(f"    Template {template_name}: {prob:.4f}")
+            
+            # 显示选中模板的参数
+            try:
+                selected_template = decision_module.get_selected_template()
+                print(f"    Selected Template Parameters:")
+                for param_name, param_tensor in selected_template.named_parameters():
+                    if 'log_' in param_name:
+                        actual_value = torch.exp(param_tensor).item()
+                        clean_name = param_name.replace('log_', '')
+                        print(f"      {clean_name}: {actual_value:.4f}")
+                    else:
+                        print(f"      {param_name}: {param_tensor.item():.4f}")
+            except Exception as e:
+                print(f"    Selected Template Parameters: [Error retrieving: {e}]")
+    except Exception as e:
+        print(f"  [Error retrieving mapping configuration: {e}]")
+    
+    # === 融合决策配置部分 ===
+    print(f"\n🔀 FUSION CONFIGURATION:")
+    try:
+        for sanitized_key, prob_tensor in fusion_params.fusion_probs.items():
+            # 获取原始组名
+            if hasattr(fusion_params, 'group_name_mapping') and sanitized_key in fusion_params.group_name_mapping:
+                original_group = fusion_params.group_name_mapping[sanitized_key]
+                group_display = ' + '.join(original_group)
+            else:
+                group_display = sanitized_key
+                
+            prob_value = torch.sigmoid(prob_tensor).item()
+            decision = "FUSE" if prob_value > 0.5 else "NO_FUSE"
+            print(f"  {group_display}: {prob_value:.4f} → {decision}")
+    except Exception as e:
+        print(f"  [Error retrieving fusion configuration: {e}]")
+    
+    # === 性能指标部分 ===
+    print(f"\n⚡ PERFORMANCE METRICS:")
+    for metric_name, metric_value in final_metrics.items():
+        if isinstance(metric_value, (int, float)):
+            if 'edp' in metric_name.lower():
+                print(f"  {metric_name}: {metric_value:.4e}")
+            elif 'area' in metric_name.lower():
+                print(f"  {metric_name}: {metric_value:.4f}")
+            else:
+                print(f"  {metric_name}: {metric_value:.0f}")
+        else:
+            print(f"  {metric_name}: {metric_value}")
+    
+    print("=" * 80)
+    print("🎯 Configuration report complete - Ready for Timeloop validation!")
+    print("=" * 80)
+
+
+def save_config_to_json_file(
+    algorithm_name: str,
+    workload: str,
+    trial_num: int,
+    hardware_params: HardwareParameters,
+    mapping_params: MappingParameters,
+    fusion_params: FusionParameters,
+    final_metrics: Dict,
+    output_dir: str = './final_configs'
+) -> str:
+    """
+    将最终配置参数保存为结构化的JSON文件，用于后续的自动化验证流程。
+    
+    Args:
+        algorithm_name: 算法名称
+        workload: 工作负载名称  
+        trial_num: 试验编号
+        hardware_params: 最终硬件参数
+        mapping_params: 最终映射参数
+        fusion_params: 最终融合参数
+        final_metrics: 最终性能指标
+        output_dir: 输出目录路径
+    
+    Returns:
+        str: 保存的JSON文件路径
+    """
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 生成清理后的文件名
+    def sanitize_filename(name: str) -> str:
+        """清理文件名，移除不安全字符"""
+        # 移除文件扩展名
+        name = re.sub(r'\.(onnx|json)$', '', name, flags=re.IGNORECASE)
+        # 替换不安全字符为下划线
+        name = re.sub(r'[^\w\-_]', '_', name)
+        # 移除多余的下划线
+        name = re.sub(r'_+', '_', name)
+        # 移除开头和结尾的下划线
+        name = name.strip('_')
+        return name.lower()
+    
+    workload_sanitized = sanitize_filename(workload)
+    algorithm_sanitized = sanitize_filename(algorithm_name)
+    filename = f"{workload_sanitized}_{algorithm_sanitized}_trial_{trial_num}.json"
+    filepath = os.path.join(output_dir, filename)
+    
+    # 构建配置字典
+    config_dict = {
+        "metadata": {
+            "workload": workload,
+            "algorithm": algorithm_name,
+            "trial": trial_num,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        },
+        "hardware_configuration": {
+            "processing_elements": int(hardware_params.get_num_pes().item()),
+            "buffer_size_kb": round(hardware_params.get_buffer_size_kb().item(), 2),
+            "buffer_size_bytes": int(hardware_params.get_buffer_size_bytes().item()),
+            "total_area_mm2": round(hardware_params.get_area_cost().item(), 4)
+        },
+        "fusion_decisions": [],
+        "mapping_strategy": {},
+        "performance_metrics": {}
+    }
+    
+    # 添加融合决策信息
+    try:
+        for sanitized_key, prob_tensor in fusion_params.fusion_probs.items():
+            # 获取原始组名
+            if hasattr(fusion_params, 'group_name_mapping') and sanitized_key in fusion_params.group_name_mapping:
+                original_group = fusion_params.group_name_mapping[sanitized_key]
+                group_display = original_group  # 保持列表格式
+            else:
+                group_display = [sanitized_key]  # 转换为列表格式
+                
+            prob_value = torch.sigmoid(prob_tensor).item()
+            fused = prob_value > 0.5
+            
+            fusion_info = {
+                "group": group_display,
+                "fused": fused,
+                "probability": round(prob_value, 4)
+            }
+            config_dict["fusion_decisions"].append(fusion_info)
+    except Exception as e:
+        print(f"  [Warning] Could not extract fusion decisions: {e}")
+    
+    # 添加映射策略信息
+    try:
+        decision_modules = mapping_params.get_all_decision_modules()
+        for group_key, decision_module in decision_modules.items():
+            mapping_info = {
+                "selected_template": None,
+                "probabilities": {},
+                "parameters": {}
+            }
+            
+            # 获取模板选择概率
+            template_probs = decision_module.get_template_probabilities()
+            max_prob = 0
+            selected_template_name = None
+            
+            for i, template_name in enumerate(decision_module.template_names):
+                prob = template_probs[i].item()
+                mapping_info["probabilities"][template_name] = round(prob, 4)
+                
+                if prob > max_prob:
+                    max_prob = prob
+                    selected_template_name = template_name
+            
+            mapping_info["selected_template"] = selected_template_name
+            
+            # 获取选中模板的参数
+            try:
+                selected_template = decision_module.get_selected_template()
+                for param_name, param_tensor in selected_template.named_parameters():
+                    if 'log_' in param_name:
+                        actual_value = torch.exp(param_tensor).item()
+                        clean_name = param_name.replace('log_', '')
+                        mapping_info["parameters"][clean_name] = round(actual_value, 4)
+                    else:
+                        mapping_info["parameters"][param_name] = round(param_tensor.item(), 4)
+            except Exception as e:
+                print(f"  [Warning] Could not extract parameters for {group_key}: {e}")
+            
+            config_dict["mapping_strategy"][group_key] = mapping_info
+    except Exception as e:
+        print(f"  [Warning] Could not extract mapping strategy: {e}")
+    
+    # 添加性能指标
+    for metric_name, metric_value in final_metrics.items():
+        if metric_name != '_final_params':  # 跳过参数对象
+            if isinstance(metric_value, (int, float)):
+                if 'edp' in metric_name.lower():
+                    config_dict["performance_metrics"][metric_name] = f"{metric_value:.4e}"
+                elif 'area' in metric_name.lower():
+                    config_dict["performance_metrics"][metric_name] = round(metric_value, 4)
+                elif isinstance(metric_value, float):
+                    config_dict["performance_metrics"][metric_name] = round(metric_value, 2)
+                else:
+                    config_dict["performance_metrics"][metric_name] = metric_value
+            else:
+                config_dict["performance_metrics"][metric_name] = str(metric_value)
+    
+    # 保存JSON文件
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(config_dict, f, indent=2, ensure_ascii=False)
+        return filepath
+    except Exception as e:
+        print(f"  [Error] Failed to save JSON file: {e}")
+        return None
+
 
 def evaluate_final_design_point(final_mapping_params, final_fusion_params, hardware_params, graph: ComputationGraph, config):
     """
@@ -130,207 +383,102 @@ def evaluate_final_design_point(final_mapping_params, final_fusion_params, hardw
 # ALGORITHM IMPLEMENTATIONS
 # ==============================================================================
 
+def authoritative_evaluation_model(final_params: dict, graph: 'ComputationGraph', config: 'Config') -> dict:
+    mapping_params = final_params['mapping_params']
+    fusion_params = final_params['fusion_params']
+    hardware_params = final_params['hardware_params']
+    performance_model = ConditionalPerformanceModel()
+    with torch.no_grad():
+        final_fusion_params = FusionParameters(graph)
+        for sanitized_key, prob_logit in fusion_params.fusion_probs.items():
+            hard_decision = torch.round(torch.sigmoid(prob_logit))
+            final_fusion_params.fusion_probs[sanitized_key] = nn.Parameter(hard_decision, requires_grad=False)
+        latency, energy, area = performance_model(mapping_params, final_fusion_params, hardware_params, graph)
+        edp = latency * energy
+    return {
+        'final_loss': edp.item(),  # 使用EDP作为最终损失
+        'final_edp': edp.item(),
+        'final_latency': latency.item(),
+        'final_energy': energy.item(),
+        'final_area': area.item(),
+    }
+
 def run_fadose_experiment(graph: ComputationGraph, config: Config, num_iterations=2000, lr=1e-3, workload: str = None, trial_num: int = None) -> dict:
     """
-    Runs the full FA-DOSA joint optimization experiment.
-    
-    Args:
-        graph: The ComputationGraph object for the workload.
-        config: The configuration dictionary.
-        
-    Returns:
-        A dictionary containing the final performance metrics.
+    🚀 FA-DOSA Co-optimization Experiment
     """
-    # Initialize mapping, fusion, and hardware parameters using the new joint approach
+    print("🚀 Running FA-DOSA Co-optimization Experiment...")
     mapping_params, fusion_params, hardware_params = create_example_optimization_setup(graph)
-    
-    # Initialize performance model
-    model = ConditionalPerformanceModel()
-    
-    # Setup joint optimizer for all parameters
-    optimizer = create_joint_optimizer(mapping_params, fusion_params, hardware_params, lr=1e-4)
-    
-    # Training loop
-    num_epochs = 100  # Reduced for testing; use 1000 for final experiments
-    
-    for epoch in range(num_epochs):
+    performance_model = ConditionalPerformanceModel()
+    optimizer = optim.Adam(
+        list(mapping_params.parameters()) + 
+        list(fusion_params.parameters()) + 
+        list(hardware_params.parameters()), 
+        lr=lr
+    )
+    print(f"   🔄 Starting joint optimization: {num_iterations} iterations...")
+    for i in range(num_iterations):
         optimizer.zero_grad()
-        
-        # Calculate total loss including hardware constraints
-        total_loss = calculate_total_loss_with_hardware_constraints(
-            model, mapping_params, fusion_params, hardware_params, graph
-        )
-        
+        total_loss = calculate_total_loss_with_hardware_constraints(performance_model, mapping_params, fusion_params, hardware_params, graph)
         total_loss.backward()
         optimizer.step()
-
-    # Final evaluation
-    final_latency, final_energy, final_area = model(mapping_params, fusion_params, hardware_params, graph)
-    final_edp = final_latency * final_energy
+        if i % 200 == 0:
+            print(f"    Epoch {i}/{num_iterations}, Loss: {total_loss.item():.4f}")
+    print("\n   [🏛️ Authoritative Evaluation] Initiating unified final performance assessment...")
+    final_params = {'mapping_params': mapping_params, 'fusion_params': fusion_params, 'hardware_params': hardware_params}
+    authoritative_results = authoritative_evaluation_model(final_params, graph, config)
+    if workload and trial_num is not None:
+        save_learned_parameters(workload, trial_num, mapping_params, fusion_params, hardware_params, authoritative_results)
+    print("   ✅ FA-DOSA experiment complete.")
     
-    # Calculate individual penalty components for reporting (updated for template-based constraints)
-    final_penalty = calculate_penalty_loss(mapping_params)
-    final_template_constraint_penalty = calculate_template_constraint_penalty(mapping_params, hardware_params, graph)
-    
-    # Calculate final loss in log domain (matching training loss)
-    log_final_latency = torch.log(final_latency + 1e-9)
-    log_final_energy = torch.log(final_energy + 1e-9)
-    log_final_area = torch.log(final_area + 1e-9)
-
-    # --- UPDATED: Use template-based constraint penalties ---
-    # This allows us to guide the optimizer towards more desirable solutions.
-    final_total_loss = (
-        config.LATENCY_WEIGHT * log_final_latency + 
-        config.ENERGY_WEIGHT * log_final_energy + 
-        config.AREA_WEIGHT * log_final_area + 
-        config.PENALTY_WEIGHT * (final_penalty + final_template_constraint_penalty)
-    )
-
-    print(f"    Final loss: {final_total_loss.item():.4f}")
-    
-    # --- FIX: Use the unified evaluation function for final physical metrics ---
-    # All final performance numbers are now calculated by the "official referee"
-    # to ensure fair comparison across all algorithms.
-    final_metrics = evaluate_final_design_point(
-        mapping_params, fusion_params, hardware_params, graph, config
-    )
-
-    # Save learned parameters for case study analysis
-    if workload is not None and trial_num is not None:
-        save_learned_parameters(
-            workload=workload,
-            trial_num=trial_num,
-            mapping_params=mapping_params,
-            fusion_params=fusion_params,
-            hardware_params=hardware_params,
-            final_metrics=final_metrics
-        )
-    
-    # Return the final loss for debugging, but merge it with the authoritative
-    # metrics from the unified evaluation function.
-    return {
-        'final_loss': final_total_loss.item(),
-        **final_metrics
+    # Add parameter objects to results for configuration reporting
+    authoritative_results['_final_params'] = {
+        'hardware_params': hardware_params,
+        'mapping_params': mapping_params,
+        'fusion_params': fusion_params
     }
+    return authoritative_results
 
-
-def run_fadose_constrained_experiment(graph: ComputationGraph, config: Config, workload: str = None, trial_num: int = None) -> dict:
+def run_fadose_constrained_experiment(graph: ComputationGraph, config: Config, num_iterations=1000, lr=1e-3, workload: str = None, trial_num: int = None) -> dict:
     """
-    A controlled experiment to test FA-DOSA's software optimization capabilities
-    on a FIXED, smaller hardware configuration, identical to a potential SOTA baseline.
-    This helps diagnose whether FA-DOSA's issues stem from its hardware search (DSE)
-    or its software optimization (mapping/fusion).
+    FA-DOSA with fixed hardware.
     """
-    print("Running FA-DOSA (Constrained Hardware) Experiment...")
-    
-    # --- FIX: Calculate hardware parameters that produce exactly area = 18.92 ---
-    # Based on area formula: Area = area_base_mm2 + num_pes * area_per_pe_mm2 + buffer_size_kb * area_per_kb_sram_mm2
-    # 18.92 = 1.0 + num_pes * 0.01 + buffer_size_kb * 0.1
-    # Let's choose a reasonable balance: 64 PEs and 179.2 KB buffer
-    # Verification: 1.0 + 64 * 0.01 + 179.2 * 0.1 = 1.0 + 0.64 + 17.92 = 19.56
-    # Let's be more precise: 64 PEs and 175.6 KB buffer
-    # Verification: 1.0 + 64 * 0.01 + 175.6 * 0.1 = 1.0 + 0.64 + 17.56 = 19.2
-    # Let's try: 64 PEs and 172.8 KB buffer  
-    # Verification: 1.0 + 64 * 0.01 + 172.8 * 0.1 = 1.0 + 0.64 + 17.28 = 18.92 ✓
-    
-    target_area = 18.92
-    constrained_pes = 64
-    constrained_buffer_kb = 172.8
-    
-    # Verify the calculation
-    calculated_area = 1.0 + constrained_pes * 0.01 + constrained_buffer_kb * 0.1
-    print(f"  [CONSTRAINED] Target area: {target_area} mm²")
-    print(f"  [CONSTRAINED] Calculated area: {calculated_area:.2f} mm²")
-    print(f"  [CONSTRAINED] Hardware fixed to: {constrained_pes} PEs, {constrained_buffer_kb:.1f} KB Buffer")
-    
-    # Assert that our calculation is correct
-    assert abs(calculated_area - target_area) < 0.01, f"Area calculation error: {calculated_area} != {target_area}"
-
-    # --- FIX: Create truly FIXED hardware parameters ---
-    hardware_params = HardwareParameters(
-        initial_num_pes=constrained_pes,
-        initial_buffer_size_kb=constrained_buffer_kb
+    print("\nRunning FA-DOSA (Constrained Hardware) Experiment...")
+    mapping_params, fusion_params, hardware_params = create_example_optimization_setup(graph)
+    target_area = config._config.get('area_model', {}).get('target_area', 25.0)
+    with torch.no_grad():
+        initial_area = hardware_params.get_area_cost().item()
+        scaling_factor = (target_area / initial_area) ** 0.5 if initial_area > 0 else 1.0
+        hardware_params.log_num_pes.data *= scaling_factor
+        hardware_params.log_buffer_size_kb.data *= scaling_factor
+    for param in hardware_params.parameters():
+        param.requires_grad = False
+    print(f"  [CONSTRAINED] Target area: {target_area:.2f} mm²")
+    performance_model = ConditionalPerformanceModel()
+    optimizer = optim.Adam(
+        list(mapping_params.parameters()) + list(fusion_params.parameters()), 
+        lr=lr
     )
-    
-    # --- CRITICAL FIX: Make hardware parameters completely non-trainable ---
-    hardware_params.log_num_pes.requires_grad_(False)
-    hardware_params.log_buffer_size_kb.requires_grad_(False)
-    
-    # --- FIX: Add verification that hardware parameters produce the expected area ---
-    actual_area = hardware_params.get_area_cost()
-    print(f"  [VERIFICATION] Actual hardware area: {actual_area.item():.2f} mm²")
-    assert abs(actual_area.item() - target_area) < 0.01, f"Hardware area mismatch: {actual_area.item()} != {target_area}"
-
-    # Initialize mapping and fusion parameters (these are still learnable)
-    mapping_params = MappingParameters(graph)
-    fusion_params = FusionParameters(graph)
-    
-    # Initialize performance model
-    model = ConditionalPerformanceModel()
-    
-    # --- FIX: Create an optimizer that EXCLUDES hardware parameters ---
-    # Only optimize software parameters: mapping and fusion
-    software_params = list(mapping_params.parameters()) + list(fusion_params.parameters())
-    optimizer = optim.Adam(software_params, lr=1e-4)
-    
-    print(f"  [OPTIMIZER] Optimizing {len(software_params)} software parameters (hardware is FIXED)")
-    
-    # Training loop (same as standard FA-DOSA but with fixed hardware)
-    num_epochs = 1000
-    for epoch in range(num_epochs):
+    for i in range(num_iterations):
         optimizer.zero_grad()
-        
-        # --- FIX: Add constraint verification during optimization ---
-        # Verify hardware parameters haven't changed
-        current_area = hardware_params.get_area_cost()
-        assert abs(current_area.item() - target_area) < 0.01, f"CONSTRAINT VIOLATION: Hardware area changed to {current_area.item()} at epoch {epoch}"
-        
-        # We now pass the non-trainable hardware_params to the model
-        total_loss = calculate_total_loss_with_hardware_constraints(
-            model, mapping_params, fusion_params, hardware_params, graph
+        loss = calculate_total_loss_with_hardware_constraints(
+            performance_model, mapping_params, fusion_params, hardware_params, graph
         )
-        
-        total_loss.backward()
+        loss.backward()
         optimizer.step()
-
-        if epoch % 200 == 0:
-            print(f"    Epoch {epoch}/{num_epochs}, Loss: {total_loss.item():.4f}, Hardware Area: {current_area.item():.2f} mm²")
-            
-    # --- FIX: Final verification before evaluation ---
-    final_hw_area = hardware_params.get_area_cost()
-    print(f"  [FINAL VERIFICATION] Hardware area before evaluation: {final_hw_area.item():.2f} mm²")
-    assert abs(final_hw_area.item() - target_area) < 0.01, f"CONSTRAINT VIOLATION: Final hardware area is {final_hw_area.item()}, expected {target_area}"
-
-    # --- FIX: Use the SAME fixed hardware_params object for final evaluation ---
-    # DO NOT create new hardware parameters or use any other hardware configuration
-    final_metrics = evaluate_final_design_point(
-        mapping_params, fusion_params, hardware_params, graph, config
-    )
+        if i % 200 == 0:
+            print(f"    Epoch {i}/{num_iterations}, Loss: {loss.item():.4f}")
+    final_params = {'mapping_params': mapping_params, 'fusion_params': fusion_params, 'hardware_params': hardware_params}
+    authoritative_results = authoritative_evaluation_model(final_params, graph, config)
+    print(f"  [SUCCESS] Constrained experiment completed.")
     
-    # --- FIX: Add post-evaluation verification ---
-    reported_area = final_metrics['final_area']
-    print(f"  [POST-EVAL VERIFICATION] Reported area: {reported_area:.2f} mm²")
-    assert abs(reported_area - target_area) < 0.01, f"EVALUATION ERROR: Reported area {reported_area} != expected {target_area}"
-    
-    # --- FIX: Save learned parameters for case study analysis ---
-    if workload is not None and trial_num is not None:
-        # We pass a modified workload name to distinguish the results
-        constrained_workload_name = f"{workload}_constrained"
-        save_learned_parameters(
-            workload=constrained_workload_name,
-            trial_num=trial_num,
-            mapping_params=mapping_params,
-            fusion_params=fusion_params,
-            hardware_params=hardware_params,
-            final_metrics=final_metrics
-        )
-
-    print(f"  [SUCCESS] Constrained experiment completed. Area constraint maintained: {reported_area:.2f} mm²")
-    
-    return {
-        'final_loss': total_loss.item(),
-        **final_metrics
+    # Add parameter objects to results for configuration reporting
+    authoritative_results['_final_params'] = {
+        'hardware_params': hardware_params,
+        'mapping_params': mapping_params,
+        'fusion_params': fusion_params
     }
+    return authoritative_results
 
 
 def run_random_search_experiment(graph: ComputationGraph, config: Config, num_samples=1000) -> dict:
@@ -434,10 +582,19 @@ def run_random_search_experiment(graph: ComputationGraph, config: Config, num_sa
         best_params['mapping'], best_params['fusion'], best_params['hardware'], graph, config
     )
     
-    return {
+    results = {
         'final_loss': best_loss,
         **final_metrics
     }
+    
+    # Add parameter objects to results for configuration reporting
+    results['_final_params'] = {
+        'hardware_params': best_params['hardware'],
+        'mapping_params': best_params['mapping'],
+        'fusion_params': best_params['fusion']
+    }
+    
+    return results
 
 def run_decoupled_sota_experiment(graph: ComputationGraph, config: Config) -> dict:
     """
@@ -511,14 +668,21 @@ def run_decoupled_sota_experiment(graph: ComputationGraph, config: Config) -> di
                     total_latency_nf += lat
                     total_energy_nf += comp_eng + sram_eng + dram_eng + noc_eng
                     
-                edp_nf = total_latency_nf * total_energy_nf
+                # Calculate log values for loss function
+                epsilon = 1e-9  # For numerical stability
+                log_latency = torch.log(total_latency_nf + epsilon)
+                log_energy = torch.log(total_energy_nf + epsilon)
+                log_area = torch.log(mock_hardware_params.get_area_cost() + epsilon)
+                
+                # Calculate penalties
                 penalty = calculate_penalty_loss(mapping_params)
                 template_constraint_penalty = calculate_template_constraint_penalty(mapping_params, mock_hardware_params, graph)
                 
                 # Loss function focused on EDP optimization
-                area_cost = mock_hardware_params.get_area_cost()
                 total_cost = (
-                    edp_nf + area_cost * 0.001 +  # Small area weight
+                    config.LATENCY_WEIGHT * log_latency + 
+                    config.ENERGY_WEIGHT * log_energy + 
+                    config.AREA_WEIGHT * log_area +  # Now uses config weight
                     config.PENALTY_WEIGHT * penalty +
                     config.PENALTY_WEIGHT * template_constraint_penalty
                 )
@@ -665,10 +829,19 @@ def run_decoupled_sota_experiment(graph: ComputationGraph, config: Config) -> di
     )
 
     # For this algorithm, the 'loss' is conceptually the final EDP.
-    return {
+    results = {
         'final_loss': final_metrics['final_edp'],
         **final_metrics
     }
+    
+    # Add parameter objects to results for configuration reporting
+    results['_final_params'] = {
+        'hardware_params': optimal_hw_config,
+        'mapping_params': optimal_mapping_params,
+        'fusion_params': final_fusion_params
+    }
+    
+    return results
 
 
 def run_twostep_baseline_experiment(graph: ComputationGraph, config: Config) -> dict:
@@ -695,8 +868,7 @@ def run_twostep_baseline_experiment(graph: ComputationGraph, config: Config) -> 
     for epoch in range(num_epochs_step1):
         optimizer.zero_grad()
         
-        # In this step, we assume no fusion occurs (p_fuse=0)
-        # We must calculate the cost manually without the full model forward pass
+        # Calculate cost assuming no fusion (fusion-agnostic mapping)
         total_latency_nf = torch.tensor(0.0)
         total_energy_nf = torch.tensor(0.0)
 
@@ -705,16 +877,23 @@ def run_twostep_baseline_experiment(graph: ComputationGraph, config: Config) -> 
             total_latency_nf += lat
             total_energy_nf += comp_eng + sram_eng + dram_eng + noc_eng
             
-        edp_nf = total_latency_nf * total_energy_nf
+        # Calculate log values for loss function
+        epsilon = 1e-9  # For numerical stability
+        log_latency = torch.log(total_latency_nf + epsilon)
+        log_energy = torch.log(total_energy_nf + epsilon)
+        log_area = torch.log(mock_hardware_params.get_area_cost() + epsilon)
+        
+        # Calculate penalties
         penalty = calculate_penalty_loss(mapping_params)
         template_constraint_penalty = calculate_template_constraint_penalty(mapping_params, mock_hardware_params, graph)
         
         # Loss function for the non-fused case
-        area_cost = mock_hardware_params.get_area_cost()
         total_cost = (
-            edp_nf + area_cost * edp_nf +
-            config.PENALTY_WEIGHT * penalty * edp_nf +
-            config.PENALTY_WEIGHT * template_constraint_penalty * edp_nf
+            config.LATENCY_WEIGHT * log_latency + 
+            config.ENERGY_WEIGHT * log_energy + 
+            config.AREA_WEIGHT * log_area +  # Now uses config weight
+            config.PENALTY_WEIGHT * penalty +
+            config.PENALTY_WEIGHT * template_constraint_penalty
         )
         
         total_cost.backward()
@@ -764,10 +943,19 @@ def run_twostep_baseline_experiment(graph: ComputationGraph, config: Config) -> 
     )
     
     # The final loss from the fusion optimization stage is used for 'final_loss'.
-    return {
+    results = {
         'final_loss': fusion_loss.item(),
         **final_metrics
     }
+    
+    # Add parameter objects to results for configuration reporting
+    results['_final_params'] = {
+        'hardware_params': mock_hardware_params,
+        'mapping_params': mapping_params,
+        'fusion_params': fusion_params
+    }
+    
+    return results
 
 
 def save_learned_parameters(
@@ -952,6 +1140,40 @@ def main():
                     
                     execution_time = time.time() - start_time
                     
+                    # 调用配置报告函数 (在写入CSV之前)
+                    if '_final_params' in results:
+                        final_params = results['_final_params']
+                        log_final_configuration(
+                            algo_name=algo_name,
+                            workload=workload,
+                            trial_num=trial + 1,
+                            hardware_params=final_params['hardware_params'],
+                            mapping_params=final_params['mapping_params'],
+                            fusion_params=final_params['fusion_params'],
+                            final_metrics=results
+                        )
+                        
+                        # 保存配置到JSON文件
+                        json_filepath = save_config_to_json_file(
+                            algorithm_name=algo_name,
+                            workload=workload,
+                            trial_num=trial + 1,
+                            hardware_params=final_params['hardware_params'],
+                            mapping_params=final_params['mapping_params'],
+                            fusion_params=final_params['fusion_params'],
+                            final_metrics=results
+                        )
+                        
+                        if json_filepath:
+                            print(f"✅ Configuration for '{algo_name}' on '{workload}' (Trial {trial + 1}) saved to: {json_filepath}")
+                        else:
+                            print(f"❌ Failed to save configuration for '{algo_name}' on '{workload}' (Trial {trial + 1})")
+                        
+                        # 从结果中移除参数对象，避免CSV序列化问题
+                        results_for_csv = {k: v for k, v in results.items() if k != '_final_params'}
+                    else:
+                        results_for_csv = results
+                    
                     # Log results with trial information
                     log_entry = {
                         'trial_num': trial + 1,
@@ -960,15 +1182,28 @@ def main():
                         'execution_time_seconds': execution_time,
                         'status': 'SUCCESS',
                         'error_message': '',
-                        **results
+                        **results_for_csv
                     }
                     log_results(results_file, log_entry)
                     
-                    print(f"    ✓ SUCCESS in {execution_time:.1f}s: Loss={results['final_loss']:.4f}, "
-                          f"EDP={results['final_edp']:.2e}, "
-                          f"Latency={results['final_latency']:.0f}, "
-                          f"Energy={results['final_energy']:.0f}, "
-                          f"Area={results['final_area']:.6f}")
+                    # 打印成功信息，但使用安全的字段访问
+                    edp_val = results_for_csv.get('final_edp', 'N/A')
+                    edp_str = f"{edp_val:.4e}" if isinstance(edp_val, (int, float)) else str(edp_val)
+                    
+                    latency_val = results_for_csv.get('final_latency', 'N/A')
+                    latency_str = f"{latency_val:.0f}" if isinstance(latency_val, (int, float)) else str(latency_val)
+                    
+                    energy_val = results_for_csv.get('final_energy', 'N/A')
+                    energy_str = f"{energy_val:.0f}" if isinstance(energy_val, (int, float)) else str(energy_val)
+                    
+                    area_val = results_for_csv.get('final_area', 'N/A')
+                    area_str = f"{area_val:.4f}" if isinstance(area_val, (int, float)) else str(area_val)
+                    
+                    print(f"    ✓ SUCCESS in {execution_time:.1f}s: "
+                          f"EDP={edp_str}, "
+                          f"Latency={latency_str}, "
+                          f"Energy={energy_str}, "
+                          f"Area={area_str}")
                     
                 except Exception as e:
                     execution_time = time.time() - start_time
