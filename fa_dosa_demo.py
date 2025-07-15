@@ -193,18 +193,17 @@ class Config:
             Config._instance = Config()
         return Config._instance
     
-    def get_weight(self, weight_name: str) -> float:
+    def get_weight(self, weight_name: str, default_value: float) -> float:
         """
-        Get a weight value from the configuration.
-        
+        Get a weight value from the configuration, with a default fallback.
         Args:
-            weight_name: Name of the weight to retrieve
-            
+            weight_name: Name of the weight to retrieve.
+            default_value: The default value to return if the weight is not found.
+        
         Returns:
-            The weight value as a float
+            The weight value as a float.
         """
-        weights = self._config.get('weights', {})
-        return weights.get(weight_name, 1.0)  # Default to 1.0 if not found
+        return self._config.get('weights', {}).get(weight_name, default_value)
 
 def find_divisors(n: int) -> List[int]:
     """
@@ -2059,89 +2058,7 @@ class ConditionalPerformanceModel(nn.Module):
         # Apply calibration factor for model tuning
         return noc_energy * torch.tensor(config.NOC_ENERGY_FACTOR, dtype=torch.float32)
     
-    def _calculate_analytical_costs(
-        self,
-        layer_name: str,
-        mapping_params: MappingParameters,
-        graph: ComputationGraph,
-        hardware_params: HardwareParameters,
-        is_fused: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Calculate analytical latency and energy costs for a layer using modular sub-functions.
-        Implements formulas from DOSA paper [3809, 3858] with enhanced cost modeling.
-        
-        Args:
-            layer_name: Name of the layer to analyze
-            mapping_params: MappingParameters object
-            graph: ComputationGraph object
-            hardware_params: HardwareParameters object containing learnable hardware config
-            is_fused: Whether this layer is part of a fused operation
-        
-        Returns:
-            latency: Computed latency based on roofline model
-            compute_energy: Energy for computation (MAC operations)
-            sram_energy: Energy for SRAM buffer accesses
-            dram_energy: Energy for DRAM accesses
-            noc_energy: Energy for Network-on-Chip data movement
-        """
-        layer_info = graph.layers[layer_name]
-        layer_mapping = mapping_params.get_mapping_by_original_name(layer_name)
-        
-        # Calculate total MACs
-        total_macs = calculate_macs(layer_info['dims'], layer_info['type'])
-        
-        # Calculate memory access counts and buffer requirements
-        access_counts = layer_mapping.get_access_counts()
-        buffer_requirements = layer_mapping.get_buffer_requirements()
-        
-        # === Use modular cost calculation functions ===
-        compute_latency = self._calculate_compute_latency(total_macs, hardware_params)
-        memory_latency = self._calculate_memory_latency(access_counts)
-        
-        # Final latency is max of compute and memory bound (roofline model)
-        latency = torch.maximum(compute_latency, memory_latency)
-        
-        # Calculate energy components using new dynamic energy model
-        dynamic_epa = self._get_dynamic_epa(hardware_params)
-        
-        # Compute energy (PE operations)
-        compute_energy = total_macs * dynamic_epa['pe']
-        
-        # Register energy (simplified estimation)
-        register_accesses = total_macs * 2.0  # 2 accesses per MAC
-        register_energy = register_accesses * dynamic_epa['reg']
-        
-        # Accumulator energy (simplified estimation)
-        accumulator_accesses = total_macs
-        accumulator_energy = accumulator_accesses * dynamic_epa['acc']
-        
-        # Scratchpad energy (based on buffer requirements)
-        total_buffer_accesses = sum(buffer_requirements.values())
-        scratchpad_energy = total_buffer_accesses * dynamic_epa['sp']
-        
-        # DRAM energy (based on access counts)
-        total_dram_accesses = sum(access_counts.values())
-        dram_energy = total_dram_accesses * dynamic_epa['dram']
-        
-        # NoC energy (unchanged)
-        noc_energy = self._calculate_noc_energy(layer_name, graph, is_fused)
-        
-        # Combine all energy components
-        sram_energy = register_energy + accumulator_energy + scratchpad_energy
-        
-        # --- FIX: Set physically reasonable lower bounds for all cost components ---
-        # This prevents the model from predicting physically impossible zero costs
-        # which can lead to inf values when used in divisions or log operations
-        min_value = 1e-6  # Minimum physically possible cost value
-        
-        latency = torch.clamp(latency, min=min_value)
-        compute_energy = torch.clamp(compute_energy, min=min_value)
-        sram_energy = torch.clamp(sram_energy, min=min_value)
-        dram_energy = torch.clamp(dram_energy, min=min_value)
-        noc_energy = torch.clamp(noc_energy, min=min_value)
-        
-        return latency, compute_energy, sram_energy, dram_energy, noc_energy
+
 
     def calculate_group_costs(
         self,
@@ -2199,53 +2116,27 @@ class ConditionalPerformanceModel(nn.Module):
             # 输入输出访问保持不变（按融合链逻辑：只有首层输入和末层输出需要DRAM访问）
         
         # === 4. 计算延迟 ===
-        # 4.1 计算延迟：基于 roofline 模型
+        # 4.1 计算延迟 (REVISED to simple additive model)
+        # 真实延迟更接近计算延迟和内存延迟的和，而不是最大值。
+        # 这个更真实的模型会给优化器正确的信号。
         compute_latency = self._calculate_compute_latency(total_macs, hardware_params)
+        # 注意: _calculate_memory_latency 内部已经处理了带宽限制，所以它代表了DRAM传输时间。
         memory_latency = self._calculate_memory_latency(total_dram_accesses)
         
-        # 延迟由计算和内存访问的最大值决定
-        total_latency = torch.maximum(compute_latency, memory_latency)
+        # 总延迟是计算时间和内存时间的累加。这是更符合物理现实的模型。
+        total_latency = compute_latency + memory_latency
         
-        # 4.2 动态融合控制开销（NEW: 基于映射策略的协同优化）
+        # 4.2 动态融合控制开销 (REFACTORED FOR STABILITY)
         if len(group_layers) > 1 and is_fusion_calculation:
-            # === 提取映射模板的Tiling因子 ===
-            tiling_complexity_factor = torch.tensor(1.0, dtype=torch.float32)
+            # 使用简化的、固定的融合开销模型以保证数值稳定性
+            base_overhead_cycles = config.FUSION_LATENCY_PENALTY_CYCLES
+            # 为融合组中的额外层增加少量固定开销，模型更稳定
+            per_layer_overhead_cycles = 10.0  # 可配置的稳定超参数
             
-            # 根据不同模板类型提取相关的Tiling因子
-            if hasattr(template_instance, 'get_M0') and hasattr(template_instance, 'get_K0'):
-                try:
-                    M0 = template_instance.get_M0()
-                    K0 = template_instance.get_K0() if hasattr(template_instance, 'get_K0') else torch.tensor(1.0)
-                    N0 = template_instance.get_N0() if hasattr(template_instance, 'get_N0') else torch.tensor(1.0)
-                    
-                    # 计算Tiling复杂度：较大的Tiling因子意味着更复杂的数据调度
-                    # 使用几何平均来平衡各维度的影响
-                    tiling_complexity_factor = torch.pow(M0 * K0 * N0, 1.0/3.0)
-                    
-                    # 归一化到合理范围 [1.0, 5.0]，避免过度惩罚
-                    tiling_complexity_factor = torch.clamp(
-                        1.0 + torch.log(tiling_complexity_factor + 1e-6), 
-                        min=1.0, 
-                        max=5.0
-                    )
-                    
-                except Exception as e:
-                    # 如果提取失败，使用默认值
-                    tiling_complexity_factor = torch.tensor(1.5, dtype=torch.float32)
-            
-            # === 计算动态融合开销 ===
-            # 基础开销
-            base_fusion_overhead = torch.tensor(config.FUSION_LATENCY_PENALTY_CYCLES, dtype=torch.float32)
-            
-            # 映射复杂度相关的开销：复杂的映射需要更多的融合协调时间
-            mapping_dependent_overhead = base_fusion_overhead * (tiling_complexity_factor - 1.0) * 0.5
-            
-            # 层数相关的开销：更多层的融合需要更复杂的控制
-            layer_count_overhead = torch.tensor(10.0 * (len(group_layers) - 1), dtype=torch.float32)
-            
-            # 总融合控制开销
-            total_fusion_overhead = base_fusion_overhead + mapping_dependent_overhead + layer_count_overhead
-            
+            total_fusion_overhead = torch.tensor(
+                base_overhead_cycles + per_layer_overhead_cycles * (len(group_layers) - 1),
+                dtype=torch.float32
+            )
             total_latency = total_latency + total_fusion_overhead
             
         elif len(group_layers) > 1:
@@ -2292,40 +2183,16 @@ class ConditionalPerformanceModel(nn.Module):
         for layer_name in group_layers:
             noc_energy = noc_energy + self._calculate_noc_energy(layer_name, graph, is_fused)
         
-        # 5.5 动态融合开销能耗（NEW: 基于映射策略的协同优化）
+        # 5.5 动态融合开销能耗 (REFACTORED FOR STABILITY)
         fusion_overhead_energy = torch.tensor(0.0, dtype=torch.float32)
         if is_fused and is_fusion_calculation:
-            # === 提取映射模板的Tiling因子（能耗版本）===
-            tiling_complexity_factor = torch.tensor(1.0, dtype=torch.float32)
-            
-            if hasattr(template_instance, 'get_M0') and hasattr(template_instance, 'get_K0'):
-                try:
-                    M0 = template_instance.get_M0()
-                    K0 = template_instance.get_K0() if hasattr(template_instance, 'get_K0') else torch.tensor(1.0)
-                    N0 = template_instance.get_N0() if hasattr(template_instance, 'get_N0') else torch.tensor(1.0)
-                    
-                    # 能耗的复杂度因子：考虑缓冲区管理和数据移动的复杂性
-                    buffer_complexity = torch.sqrt(M0 * K0 * N0)
-                    tiling_complexity_factor = torch.clamp(
-                        1.0 + torch.log(buffer_complexity + 1e-6) * 0.3,  # 更温和的增长
-                        min=1.0, 
-                        max=3.0
-                    )
-                    
-                except Exception as e:
-                    tiling_complexity_factor = torch.tensor(1.2, dtype=torch.float32)
-            
-            # === 计算动态融合能耗开销 ===
-            # 基础融合能耗开销
-            base_fusion_energy = torch.tensor(config.FUSION_OVERHEAD_COST, dtype=torch.float32)
-            
-            # 映射复杂度相关的能耗：复杂映射增加控制电路和缓冲管理的能耗
-            mapping_dependent_energy = base_fusion_energy * (tiling_complexity_factor - 1.0) * 0.4
-            
-            # 数据量相关的额外开销：大Tiling因子意味着更多的中间数据管理
-            data_management_energy = torch.tensor(0.1, dtype=torch.float32) * tiling_complexity_factor * len(group_layers)
-            
-            fusion_overhead_energy = base_fusion_energy + mapping_dependent_energy + data_management_energy
+            # 使用简化的、固定的融合能耗开销
+            base_fusion_energy = config.FUSION_OVERHEAD_COST
+            per_layer_energy_overhead = 50.0  # 另一个可配置的稳定超参数
+            fusion_overhead_energy = torch.tensor(
+                base_fusion_energy + per_layer_energy_overhead * (len(group_layers) - 1),
+                dtype=torch.float32
+            )
             
         elif is_fused:
             # 静态融合能耗开销（兼容性保持）
@@ -2342,81 +2209,34 @@ class ConditionalPerformanceModel(nn.Module):
         
         return total_latency, total_energy
 
-    def _calculate_layer_cost_for_fusion(
+
+    def _calculate_analytical_costs(
         self,
         layer_name: str,
-        template_instance: DifferentiableMappingTemplate,
-        hardware_params: HardwareParameters,
+        mapping_params: MappingParameters,
         graph: ComputationGraph,
-        position: str  # 'head', 'middle', 'tail'
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hardware_params: HardwareParameters,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        计算融合链中单个层的延迟和能耗。
-        
-        严格遵循 Mind the Gap 论文的异构映射模板策略：
-        - 链头 (head): 输入来自DRAM，输出到SRAM
-        - 链中 (middle): 输入输出都在SRAM
-        - 链尾 (tail): 输入来自SRAM，输出到DRAM
-        
-        Args:
-            layer_name: 当前层的名称
-            template_instance: 根据位置严格指定的模板实例
-            hardware_params: 硬件参数
-            graph: 计算图
-            position: 层在链中的位置 ('head', 'middle', 'tail')
-            
-        Returns:
-            (layer_latency, layer_energy): 该层的延迟和能耗
+        Compatibility method for baseline experiments using the corrected ADDITIVE latency model.
+        Returns: (latency, comp_energy, sram_energy, dram_energy, noc_energy)
         """
-        config = Config.get_instance()
+        template_instance = mapping_params.get_layer_selected_template(layer_name)
         
-        # 1. 获取该模板下的 buffer 需求和分级访存次数
-        buffer_reqs = template_instance.get_buffer_requirements()
-        access_counts = template_instance.get_access_counts()
+        # Use the main cost function to get total latency and energy
+        total_latency, total_energy = self.calculate_group_costs(
+            [layer_name], template_instance, hardware_params, graph, is_fusion_calculation=False
+        )
+
+        # For compatibility with baselines, we provide an estimated breakdown.
+        # This breakdown doesn't affect FA-DOSA's own optimization, which uses total_energy.
+        comp_energy = total_energy * 0.3  # Rough estimation
+        dram_energy = total_energy * 0.5  
+        sram_energy = total_energy * 0.15 
+        noc_energy = total_energy * 0.05
         
-        # 2. 获取动态EPA值
-        dynamic_epas = self._get_dynamic_epa(hardware_params)
-        
-        # 3. 计算延迟 (简化版，可细化)
-        total_macs = calculate_macs(graph.layers[layer_name]['dims'], graph.layers[layer_name]['type'])
-        compute_latency = self._calculate_compute_latency(total_macs, hardware_params)
-        
-        # 内存延迟只考虑DRAM，因为SRAM访问被假设隐藏
-        dram_accesses = access_counts.get('input_dram', torch.tensor(0.0)) + \
-                       access_counts.get('weight_dram', torch.tensor(0.0)) + \
-                       access_counts.get('output_dram', torch.tensor(0.0))
-        memory_latency = dram_accesses * dynamic_epas['dram'] / (config.DRAM_BANDWIDTH * 1e9)
-        layer_latency = torch.maximum(compute_latency, memory_latency)
-        
-        # 4. 计算能耗（关键部分）
-        compute_energy = total_macs * dynamic_epas['pe']
-        weight_energy = torch.tensor(0.0, dtype=torch.float32)
-        io_energy = torch.tensor(0.0, dtype=torch.float32)
-        
-        # 根据位置决定 IO 能耗计算方式
-        if position == 'head':
-            # 输入来自DRAM，输出到SRAM
-            input_accesses = access_counts.get('input_dram', torch.tensor(0.0))
-            output_accesses = access_counts.get('output_sram', torch.tensor(0.0))
-            io_energy = input_accesses * dynamic_epas['dram'] + output_accesses * dynamic_epas['sp']
-        elif position == 'middle':
-            # 输入输出都在SRAM
-            input_accesses = access_counts.get('input_sram', torch.tensor(0.0))
-            output_accesses = access_counts.get('output_sram', torch.tensor(0.0))
-            io_energy = (input_accesses + output_accesses) * dynamic_epas['sp']
-        elif position == 'tail':
-            # 输入来自SRAM，输出到DRAM
-            input_accesses = access_counts.get('input_sram', torch.tensor(0.0))
-            output_accesses = access_counts.get('output_dram', torch.tensor(0.0))
-            io_energy = input_accesses * dynamic_epas['sp'] + output_accesses * dynamic_epas['dram']
-        
-        # 权重能耗（假设默认从DRAM读取）
-        weight_accesses = access_counts.get('weight_dram', torch.tensor(0.0))
-        weight_energy = weight_accesses * dynamic_epas['dram']
-        
-        layer_energy = compute_energy + weight_energy + io_energy
-        
-        return layer_latency, layer_energy
+        return total_latency, comp_energy, sram_energy, dram_energy, noc_energy
+
 
     def forward(
         self,
@@ -2426,173 +2246,177 @@ class ConditionalPerformanceModel(nn.Module):
         graph: ComputationGraph
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        重构后的前向传播：基于映射模板的精确成本计算。
-        
-        新的计算流程：
-        1. 遍历所有融合组和独立层
-        2. 对每个组，获取其 MappingDecisionModule
-        3. 使用模板选择概率进行加权平均
-        4. 为每种模板计算精确成本
-        5. 处理融合开关逻辑
-        
-        Args:
-            mapping_params: 映射策略管理器
-            fusion_params: 融合参数
-            hardware_params: 硬件参数
-            graph: 计算图
-            
-        Returns:
-            (total_latency, total_energy, area_cost): 总延迟、总能耗、芯片面积
+        REFACTORED FORWARD METHOD: Unified, Expectation-Based Cost Calculation.
+
+        This method calculates total latency, energy, and area by consistently applying
+        an expectation model over mapping templates for both fused and non-fused scenarios.
+        This resolves the conflicting gradient problem of the previous implementation.
         """
         config = Config.get_instance()
-        
-        # 获取硬件面积成本
         area_cost = hardware_params.get_area_cost()
-        
-        # 初始化总成本
+
         total_latency = torch.tensor(0.0, dtype=torch.float32)
         total_energy = torch.tensor(0.0, dtype=torch.float32)
-        
-        # 获取所有决策模块
-        all_decision_modules = mapping_params.get_all_decision_modules()
-        group_mapping = mapping_params.group_mapping
-        
-        # === 遍历所有计算组（融合组 + 独立层）===
-        for group_key, decision_module in all_decision_modules.items():
-            group_layers = group_mapping[group_key]
-            
-            # === 获取模板选择概率 ===
-            template_probabilities = decision_module.get_template_probabilities()
-            
-            # === 为每种模板计算成本 ===
-            template_costs = []  # [(latency, energy), ...]
-            
-            for i, template_name in enumerate(decision_module.template_names):
-                template_instance = decision_module.get_template_by_name(template_name)
+
+        # Identify all computational groups (standalone layers and fusion groups)
+        processed_layers = set()
+        computational_groups = []
+        for group in graph.fusion_groups:
+            computational_groups.append(group)
+            for layer in group:
+                processed_layers.add(layer)
+        for layer_name in graph.get_layer_names():
+            if layer_name not in processed_layers:
+                computational_groups.append([layer_name])
+
+        # Iterate over each computational group
+        for group_layers in computational_groups:
+            is_fusion_group = len(group_layers) > 1
+
+            # A. Calculate the cost of the group if it runs UNFUSED (sum of individual layer costs)
+            non_fused_latency = torch.tensor(0.0, dtype=torch.float32)
+            non_fused_energy = torch.tensor(0.0, dtype=torch.float32)
+            for layer_name in group_layers:
+                # Each layer's cost is the expectation over its own mapping templates
+                layer_decision_module = mapping_params.get_decision_module_for_layer(layer_name)
+                template_probs = layer_decision_module.get_template_probabilities()
                 
-                # 使用核心成本计算函数
-                template_latency, template_energy = self.calculate_group_costs(
-                    group_layers, template_instance, hardware_params, graph,
-                    is_fusion_calculation=False  # 初始计算不启用动态融合开销
-                )
-                template_costs.append((template_latency, template_energy))
-            
-            # === 计算该组的期望成本（模板概率加权平均）===
-            group_latency = torch.tensor(0.0, dtype=torch.float32)
-            group_energy = torch.tensor(0.0, dtype=torch.float32)
-            
-            for i, (template_latency, template_energy) in enumerate(template_costs):
-                prob = template_probabilities[i]
-                group_latency = group_latency + prob * template_latency
-                group_energy = group_energy + prob * template_energy
-            
-            # === 处理融合开关逻辑（如果是融合组）===
-            if len(group_layers) > 1:
-                # 这是一个融合组，需要考虑融合概率
-                p_fuse = fusion_params.get_fusion_probability(group_layers)
+                exp_lat = torch.tensor(0.0, dtype=torch.float32)
+                exp_eng = torch.tensor(0.0, dtype=torch.float32)
+                for i, template_name in enumerate(layer_decision_module.template_names):
+                    template = layer_decision_module.get_template_by_name(template_name)
+                    # Calculate cost for this specific template as a standalone unit
+                    lat, eng = self.calculate_group_costs(
+                        [layer_name], template, hardware_params, graph, is_fusion_calculation=False
+                    )
+                    # Ensure scalar multiplication
+                    prob_scalar = template_probs[i].item() if template_probs[i].dim() > 0 else template_probs[i]
+                    exp_lat = exp_lat + prob_scalar * lat
+                    exp_eng = exp_eng + prob_scalar * eng
                 
-                # === 重构：使用异构映射模板策略计算融合成本 ===
-                # 严格遵循 Mind the Gap 论文的异构映射模板策略
+                non_fused_latency = non_fused_latency + exp_lat
+                non_fused_energy = non_fused_energy + exp_eng
+
+            # B. If it's a fusion group, calculate the cost if it runs FUSED
+            if is_fusion_group:
+                # The fused cost is the expectation over the FUSION GROUP's mapping templates
+                group_decision_module = mapping_params.get_decision_module_for_fusion_group(group_layers)
+                template_probs = group_decision_module.get_template_probabilities()
+
                 fused_latency = torch.tensor(0.0, dtype=torch.float32)
                 fused_energy = torch.tensor(0.0, dtype=torch.float32)
-                
-                # 遍历融合组内的每一层，根据位置严格指定模板
-                for i, layer_name in enumerate(group_layers):
-                    # 确定层的位置
-                    if i == 0:
-                        position = 'head'  # 链头
-                    elif i == len(group_layers) - 1:
-                        position = 'tail'  # 链尾
-                    else:
-                        position = 'middle'  # 链中
-                    
-                    # 获取该层对应的决策模块
-                    layer_decision_module = mapping_params.get_decision_module_for_layer(layer_name)
-                    
-                    # 严格指定模板：根据位置规则直接获取指定的模板实例
-                    if position == 'head':
-                        # 链头：必须使用最灵活的 DMT_GEMM_TiledKN 模板
-                        template_instance = layer_decision_module.get_template_by_name('tiled_kn')
-                    elif position == 'middle':
-                        # 链中：必须使用最严格的 DMT_GEMM_Full 模板
-                        template_instance = layer_decision_module.get_template_by_name('full')
-                    elif position == 'tail':
-                        # 链尾：可以使用 DMT_GEMM_TiledN 模板
-                        # 特殊情况 (E=2): 对于只有两个算子的链，第二个算子也可以使用 TiledKN
-                        if len(group_layers) == 2:
-                            template_instance = layer_decision_module.get_template_by_name('tiled_kn')
-                        else:
-                            template_instance = layer_decision_module.get_template_by_name('tiled_n')
-                    
-                    # 计算该单层的成本
-                    layer_latency, layer_energy = self._calculate_layer_cost_for_fusion(
-                        layer_name, template_instance, hardware_params, graph, position
+
+                for i, template_name in enumerate(group_decision_module.template_names):
+                    template = group_decision_module.get_template_by_name(template_name)
+                    # Calculate cost for this template over the WHOLE FUSED GROUP
+                    lat, eng = self.calculate_group_costs(
+                        group_layers, template, hardware_params, graph, is_fusion_calculation=True
                     )
-                    
-                    # 组合成本：这是最关键的一步
-                    # 延迟：融合链的总延迟由最慢的阶段决定，并累加上额外的开销
-                    fusion_overhead_per_layer = torch.tensor(10.0, dtype=torch.float32)  # 每层的融合开销
-                    fused_latency = torch.maximum(fused_latency, layer_latency) + fusion_overhead_per_layer
-                    
-                    # 能耗：能耗是累加的，但需要精确处理数据流
-                    fused_energy = fused_energy + layer_energy
+                    # Ensure scalar multiplication
+                    prob_scalar = template_probs[i].item() if template_probs[i].dim() > 0 else template_probs[i]
+                    fused_latency = fused_latency + prob_scalar * lat
+                    fused_energy = fused_energy + prob_scalar * eng
                 
-                # 计算非融合成本：将组内各层视为独立单元（保持原有逻辑）
-                non_fused_latency = torch.tensor(0.0, dtype=torch.float32)
-                non_fused_energy = torch.tensor(0.0, dtype=torch.float32)
-                
-                for layer_name in group_layers:
-                    # 获取该层的决策模块
-                    layer_decision_module = mapping_params.get_decision_module_for_layer(layer_name)
-                    layer_template_probs = layer_decision_module.get_template_probabilities()
-                    
-                    # 计算该层的独立成本
-                    layer_latency = torch.tensor(0.0, dtype=torch.float32)
-                    layer_energy = torch.tensor(0.0, dtype=torch.float32)
-                    
-                    for j, template_name in enumerate(layer_decision_module.template_names):
-                        template_instance = layer_decision_module.get_template_by_name(template_name)
-                        
-                        # 单层成本（作为独立层计算，不启用动态融合开销）
-                        template_lat, template_eng = self.calculate_group_costs(
-                            [layer_name], template_instance, hardware_params, graph,
-                            is_fusion_calculation=False  # 不启用动态融合开销
-                        )
-                        
-                        prob = layer_template_probs[j]
-                        layer_latency = layer_latency + prob * template_lat
-                        layer_energy = layer_energy + prob * template_eng
-                    
-                    non_fused_latency = non_fused_latency + layer_latency
-                    non_fused_energy = non_fused_energy + layer_energy
-                
-                # === 基于异构映射模板策略的融合决策 ===
-                final_group_latency = p_fuse * fused_latency + (1 - p_fuse) * non_fused_latency
-                final_group_energy = p_fuse * fused_energy + (1 - p_fuse) * non_fused_energy
+                # C. Combine fused and non-fused costs using the learnable fusion probability
+                p_fuse = fusion_params.get_fusion_probability(group_layers)
+                p_fuse_scalar = p_fuse.item() if p_fuse.dim() > 0 else p_fuse
+                final_group_latency = p_fuse_scalar * fused_latency + (1 - p_fuse_scalar) * non_fused_latency
+                final_group_energy = p_fuse_scalar * fused_energy + (1 - p_fuse_scalar) * non_fused_energy
             else:
-                # 独立层，直接使用计算出的成本
-                final_group_latency = group_latency
-                final_group_energy = group_energy
+                # It's a standalone layer, its cost is simply the non_fused_cost
+                final_group_latency = non_fused_latency
+                final_group_energy = non_fused_energy
             
-            # === 累加到总成本 ===
+            # D. Accumulate the final cost for this group
             total_latency = total_latency + final_group_latency
             total_energy = total_energy + final_group_energy
-        
-        # === 数值稳定性检查 ===
-        min_value = 1e-6
+
+        # Final numerical stability checks
+        min_value = 1e-9
         total_latency = torch.clamp(total_latency, min=min_value)
         total_energy = torch.clamp(total_energy, min=min_value)
         area_cost = torch.clamp(area_cost, min=min_value)
-        
-        # 断言检查
-        assert not torch.isinf(total_latency), f"Latency exploded to infinity! Value: {total_latency}"
-        assert not torch.isnan(total_latency), f"Latency became NaN! This indicates numerical instability."
-        assert not torch.isinf(total_energy), f"Energy exploded to infinity! Value: {total_energy}"
-        assert not torch.isnan(total_energy), f"Energy became NaN! This indicates numerical instability."
-        assert not torch.isinf(area_cost), f"Area cost exploded to infinity! Value: {area_cost}"
-        assert not torch.isnan(area_cost), f"Area cost became NaN! This indicates numerical instability."
-        
+
+        assert not torch.isinf(total_latency), f"Latency is inf"
+        assert not torch.isnan(total_latency), f"Latency is NaN"
+        assert not torch.isinf(total_energy), f"Energy is inf"
+        assert not torch.isnan(total_energy), f"Energy is NaN"
+
         return total_latency, total_energy, area_cost
+
+    def calculate_group_costs(
+        self,
+        group_layers: List[str],
+        template_instance: DifferentiableMappingTemplate,
+        hardware_params: HardwareParameters,
+        graph: ComputationGraph,
+        is_fusion_calculation: bool
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Core cost calculation function. Calculates latency and energy for a computational group
+        (either a single layer or a fused group) based on a GIVEN mapping template.
+
+        Args:
+            group_layers: List of layer names in the group.
+            template_instance: The specific mapping template to use for cost calculation.
+            hardware_params: The current hardware parameters.
+            graph: The computation graph.
+            is_fusion_calculation: A boolean indicating if we should apply fusion physics.
+
+        Returns:
+            A tuple of (latency, energy).
+        """
+        config = Config.get_instance()
+
+        # 1. Calculate total MACs for the group
+        total_macs = sum(calculate_macs(graph.layers[name]['dims'], graph.layers[name]['type']) for name in group_layers)
+
+        # 2. Get memory access counts from the template
+        access_counts = template_instance.get_access_counts()
+
+        # 3. Apply fusion physics if this is a fused calculation
+        if is_fusion_calculation and len(group_layers) > 1:
+            # Key fusion benefit: eliminate intermediate DRAM access.
+            # The provided template access counts are for a SINGLE op. We must adjust them.
+            # This is a simplified model. A more advanced one would analyze the dataflow inside the group.
+            
+            # Total weights access = sum of all layers' weights access
+            total_weight_access = access_counts['weight'] * len(group_layers)
+            
+            # Total I/O access = Input of first layer + Output of last layer
+            # The template's 'input' and 'output' counts represent one op, which is a good approximation here.
+            total_io_access = access_counts['input'] + access_counts['output']
+            
+            total_dram_access_bytes = (total_weight_access + total_io_access) * config.BYTES_PER_ELEMENT
+        else:
+            # For non-fused calculation, just sum up accesses for all layers in the group
+            total_dram_access_bytes = sum(access_counts.values()) * len(group_layers) * config.BYTES_PER_ELEMENT
+
+        # 4. Calculate Latency (REVISED to additive model)
+        compute_latency = self._calculate_compute_latency(total_macs, hardware_params)
+        memory_latency = total_dram_access_bytes / (config.DRAM_BANDWIDTH * 1e9) # Convert GB/s to B/s
+        latency = compute_latency + memory_latency
+        
+        # Add fusion overhead for latency if fused
+        if is_fusion_calculation and len(group_layers) > 1:
+            latency += config.FUSION_LATENCY_PENALTY_CYCLES
+
+        # 5. Calculate Energy
+        dynamic_epa = self._get_dynamic_epa(hardware_params)
+        compute_energy = total_macs * dynamic_epa['pe']
+        dram_energy = total_dram_access_bytes * dynamic_epa['dram'] # Simplified DRAM energy
+        
+        # Simplified SRAM energy based on buffer requirements from the template
+        buffer_reqs_words = sum(template_instance.get_buffer_requirements().values())
+        sram_energy = buffer_reqs_words * config.BYTES_PER_ELEMENT * dynamic_epa['sp']
+        
+        total_energy = compute_energy + dram_energy + sram_energy
+        
+        # Add fusion overhead for energy if fused
+        if is_fusion_calculation and len(group_layers) > 1:
+            total_energy += config.FUSION_OVERHEAD_COST
+            
+        return latency, total_energy
 
 def calculate_product_constraint_penalty(
     mapping_params: 'MappingParameters',
@@ -2689,56 +2513,45 @@ def create_joint_optimizer(mapping_params: MappingParameters,
     return torch.optim.Adam(all_params, lr=lr)
 
 def calculate_total_loss_with_hardware_constraints(
-    performance_model: ConditionalPerformanceModel,
-    mapping_params: MappingParameters,
-    fusion_params: FusionParameters, 
-    hardware_params: HardwareParameters,
-    graph: ComputationGraph
+    performance_model: 'ConditionalPerformanceModel',
+    mapping_params: 'MappingParameters',
+    fusion_params: 'FusionParameters',
+    hardware_params: 'HardwareParameters',
+    graph: 'ComputationGraph'
 ) -> torch.Tensor:
     """
-    重构后的总损失函数：使用基于模板的约束，移除面积项。
-    
-    Args:
-        performance_model: 重构后的 ConditionalPerformanceModel 实例
-        mapping_params: 映射策略管理器
-        fusion_params: 融合参数
-        hardware_params: 硬件参数
-        graph: 计算图
-        
-    Returns:
-        用于优化的总损失张量
+    重构后的总损失函数：使用EDP作为核心优化目标，并将惩罚项统一处理。
     """
     config = Config.get_instance()
     
-    # 使用重构后的性能模型计算性能指标
+    # 步骤 1: 计算原始的性能指标 (latency, energy, area)
     latency, energy, area = performance_model(mapping_params, fusion_params, hardware_params, graph)
     
-    # 计算新的基于模板的约束惩罚
-    mapping_penalty = calculate_penalty_loss(mapping_params)  # 重构后的函数
-    template_constraint_penalty = calculate_template_constraint_penalty(mapping_params, hardware_params, graph)  # 新的约束函数
+    # 步骤 2: 计算所有约束惩罚的总和
+    mapping_penalty = calculate_penalty_loss(mapping_params)  # Tiling因子 > 1 约束
+    template_constraint_penalty = calculate_template_constraint_penalty(
+        mapping_params, hardware_params, graph
+    )  # Buffer 和硬件参数约束
+    total_penalty = mapping_penalty + template_constraint_penalty
+
+    # 步骤 3: 构建新的、更稳定的总损失函数
+    # 主要优化目标是 EDP (Energy-Delay Product)
+    edp = latency * energy
     
-    # 移除旧的 product_penalty 和 hardware_penalty，因为它们已被新的模板约束函数取代
-    # product_penalty = calculate_product_constraint_penalty(mapping_params, graph)  # 已废弃
-    # hardware_penalty = calculate_hardware_constraint_penalty(mapping_params, hardware_params, graph)  # 已废弃
-    
-    # === STEP 1: Force Log-Scale Calculation for Numerical Stability ===
-    # Calculate loss in log domain BEFORE applying weights to prevent numerical explosion
-    epsilon = 1e-9  # For numerical stability
-    log_latency = torch.log(latency + epsilon)
-    log_energy = torch.log(energy + epsilon)
+    epsilon = 1e-9  # 保证数值稳定，防止 log(0)
+
+    # 在对数域中组合所有成本项
+    log_edp = torch.log(edp + epsilon)
     log_area = torch.log(area + epsilon)
     
-    # === Simplified Log-Scale Loss (as requested) ===
-    # Use config weights for proper scaling
+    # 新的总损失: 以 log(EDP) 为核心，加上加权的 log(Area) 和总惩罚项
+    # 注意：我们直接将线性的 total_penalty 加到对数损失上，其影响由 penalty_weight 控制
     total_loss = (
-        config.LATENCY_WEIGHT * log_latency +
-        # For now, use a single energy weight for simplicity (total energy)
-        1.0 * log_energy +  # Temporarily use a single weight for total energy
-        config.AREA_WEIGHT * log_area +
-        config.PENALTY_WEIGHT * mapping_penalty +
-        config.PENALTY_WEIGHT * template_constraint_penalty  # Use the same penalty weight for now
+        config.get_weight('edp_weight', 1.0) * log_edp +       # 主要目标
+        config.get_weight('area_weight', 0.5) * log_area +     # 次要目标/约束
+        config.PENALTY_WEIGHT * total_penalty                # 惩罚项
     )
-    
+
     return total_loss
 
 if __name__ == "__main__":

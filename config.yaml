@@ -30,18 +30,20 @@ costs:
 # These weights control how much the optimizer cares about different physical costs
 weights:
   # Performance and area weights
-  latency_weight: 1.0              # Reduced from 1.5 to 1.0 for moderate focus
-  area_weight: 0.1                 # Set to 0.1 to weakly enable area optimization
+  latency_weight: 1.0
+  energy_weight: 1.5 # Weight total energy
+  area_weight: 0.5   # Moderately penalize large area
+
+  # Constraint violation penalties - MUST BE HIGH
+  penalty_weight: 500.0  # Drastically increase to strictly enforce constraints
   
-  # === ENERGY WEIGHTS: Now decomposed by physical cost ===
-  # These separate weights allow fine-grained control over optimization priorities
-  compute_energy_weight: 0.75      # MAC operations are relatively cheap (1.5x)
-  sram_energy_weight: 1.5          # Reduced from 3.0 to 1.5 for moderate cost
-  dram_energy_weight: 2.0          # 🔥 CRITICAL: Reduced from 30.0 to 2.0 for stability
-  noc_energy_weight: 2.25          # Network-on-chip communication cost (1.5x)
-  
-  # Constraint violation penalties
-  penalty_weight: 10.0             # Reduced from 500.0 to 10.0 for stability
+  # The following detailed energy weights are for potential future use,
+  # but the single 'energy_weight' above is sufficient for now.
+  # You can keep them here for reference.
+  # compute_energy_weight: 0.5
+  # sram_energy_weight: 1.0
+  # dram_energy_weight: 25.0  # HIGHLY important for fusion
+  # noc_energy_weight: 1.5
 
 # === NEW: Calibration factors for model tuning ===
 calibration:
