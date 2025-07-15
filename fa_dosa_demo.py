@@ -192,6 +192,19 @@ class Config:
         if Config._instance is None:
             Config._instance = Config()
         return Config._instance
+    
+    def get_weight(self, weight_name: str) -> float:
+        """
+        Get a weight value from the configuration.
+        
+        Args:
+            weight_name: Name of the weight to retrieve
+            
+        Returns:
+            The weight value as a float
+        """
+        weights = self._config.get('weights', {})
+        return weights.get(weight_name, 1.0)  # Default to 1.0 if not found
 
 def find_divisors(n: int) -> List[int]:
     """
@@ -2708,19 +2721,22 @@ def calculate_total_loss_with_hardware_constraints(
     # product_penalty = calculate_product_constraint_penalty(mapping_params, graph)  # 已废弃
     # hardware_penalty = calculate_hardware_constraint_penalty(mapping_params, hardware_params, graph)  # 已废弃
     
-    # 使用对数域进行数值稳定的损失计算
-    epsilon = 1e-9
+    # === STEP 1: Force Log-Scale Calculation for Numerical Stability ===
+    # Calculate loss in log domain BEFORE applying weights to prevent numerical explosion
+    epsilon = 1e-9  # For numerical stability
     log_latency = torch.log(latency + epsilon)
     log_energy = torch.log(energy + epsilon)
-    # 移除面积项：log_area = torch.log(area + epsilon)
+    log_area = torch.log(area + epsilon)
     
-    # 组合所有组件并加权（移除面积项）
+    # === Simplified Log-Scale Loss (as requested) ===
+    # Use config weights for proper scaling
     total_loss = (
-        config.LATENCY_WEIGHT * log_latency + 
-        config.ENERGY_WEIGHT * log_energy + 
-        # config.AREA_WEIGHT * log_area +  # 移除面积项
+        config.LATENCY_WEIGHT * log_latency +
+        # For now, use a single energy weight for simplicity (total energy)
+        1.0 * log_energy +  # Temporarily use a single weight for total energy
+        config.AREA_WEIGHT * log_area +
         config.PENALTY_WEIGHT * mapping_penalty +
-        config.PENALTY_WEIGHT * template_constraint_penalty  # 新的模板约束惩罚
+        config.PENALTY_WEIGHT * template_constraint_penalty  # Use the same penalty weight for now
     )
     
     return total_loss

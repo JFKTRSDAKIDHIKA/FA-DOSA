@@ -26,22 +26,22 @@ costs:
   # Note: Old hardcoded energy parameters have been removed in favor of 
   # the new 40nm process dynamic energy model implemented in the code
 
-# === NEW: Physics-aware loss function weights ===
+# === STEP 2: Drastically Tuned Down Weights for Numerical Stability ===
 # These weights control how much the optimizer cares about different physical costs
 weights:
   # Performance and area weights
-  latency_weight: 1.5              # Increased by 1.5x for stronger EDP focus
-  area_weight: 0.0                 # Set to one to enable area cost
+  latency_weight: 1.0              # Reduced from 1.5 to 1.0 for moderate focus
+  area_weight: 0.1                 # Set to 0.1 to weakly enable area optimization
   
   # === ENERGY WEIGHTS: Now decomposed by physical cost ===
   # These separate weights allow fine-grained control over optimization priorities
   compute_energy_weight: 0.75      # MAC operations are relatively cheap (1.5x)
-  sram_energy_weight: 3.0          # On-chip SRAM access has moderate cost (1.5x)
-  dram_energy_weight: 30.0         # 🔥 CRITICAL: High weight punishes expensive DRAM access (1.5x)
+  sram_energy_weight: 1.5          # Reduced from 3.0 to 1.5 for moderate cost
+  dram_energy_weight: 2.0          # 🔥 CRITICAL: Reduced from 30.0 to 2.0 for stability
   noc_energy_weight: 2.25          # Network-on-chip communication cost (1.5x)
   
   # Constraint violation penalties
-  penalty_weight: 500.0            # Penalty for invalid tiling factors (< 1)
+  penalty_weight: 10.0             # Reduced from 500.0 to 10.0 for stability
 
 # === NEW: Calibration factors for model tuning ===
 calibration:

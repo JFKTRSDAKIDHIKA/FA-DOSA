@@ -403,7 +403,7 @@ def authoritative_evaluation_model(final_params: dict, graph: 'ComputationGraph'
         'final_area': area.item(),
     }
 
-def run_fadose_experiment(graph: ComputationGraph, config: Config, num_iterations=100, lr=1e-3, workload: str = None, trial_num: int = None) -> dict:
+def run_fadose_experiment(graph: ComputationGraph, config: Config, num_iterations=300, lr=1e-3, workload: str = None, trial_num: int = None) -> dict:
     """
     🚀 FA-DOSA Co-optimization Experiment
     """
@@ -416,12 +416,29 @@ def run_fadose_experiment(graph: ComputationGraph, config: Config, num_iteration
         list(hardware_params.parameters()), 
         lr=lr
     )
+    
+    # === STEP 3: Introduce Learning Rate Scheduler for Adaptive Optimization ===
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+    
     print(f"   🔄 Starting joint optimization: {num_iterations} iterations...")
     for i in range(num_iterations):
         optimizer.zero_grad()
         total_loss = calculate_total_loss_with_hardware_constraints(performance_model, mapping_params, fusion_params, hardware_params, graph)
         total_loss.backward()
+        
+        # === STEP 4: Implement Gradient Clipping for Stability ===
+        torch.nn.utils.clip_grad_norm_(
+            list(mapping_params.parameters()) + 
+            list(fusion_params.parameters()) + 
+            list(hardware_params.parameters()), 
+            max_norm=1.0
+        )
+        
         optimizer.step()
+        
+        # === STEP 3: Add scheduler step after optimizer step ===
+        scheduler.step(total_loss)
+        
         if i % 20 == 0:
             print(f"    Epoch {i}/{num_iterations}, Loss: {total_loss.item():.4f}")
     print("\n   [🏛️ Authoritative Evaluation] Initiating unified final performance assessment...")
