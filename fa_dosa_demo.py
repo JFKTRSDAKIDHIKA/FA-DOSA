@@ -130,11 +130,11 @@ class Config:
         self.BYTES_PER_ELEMENT = self._config['hardware']['bytes_per_element']
         
         # Cost model parameters
-        self.DRAM_ACCESS_COST = self._config['costs']['dram_access_cost_pj_byte']
-        self.SRAM_BASE_COST = self._config['costs']['sram_base_cost_pj_byte']
         self.FUSION_OVERHEAD_COST = self._config['costs']['fusion_overhead_cost_pj']
         self.AREA_COEFFICIENT = self._config['costs']['area_coefficient_mm2_per_kb']
-        self.SRAM_ENERGY_SCALING = self._config['costs']['sram_energy_scaling_pj_byte_kb']
+        
+        # Note: DRAM_ACCESS_COST, SRAM_BASE_COST, and SRAM_ENERGY_SCALING have been removed
+        # as they are now calculated dynamically in the _get_dynamic_epa method
         
         # Hardware parameters
         self.DRAM_BANDWIDTH = self._config['hardware']['dram_bandwidth_gb_s']
@@ -709,9 +709,16 @@ class DMT_GEMM_Full(DifferentiableMappingTemplate):
         M1 = self.get_M1()  # M / M0
         
         return {
-            'input': self.M_total * self.K_total,                    # M * K
-            'weight': self.K_total * self.N_total * M1,              # K * N * M1  
-            'output': self.M_total * self.N_total                    # M * N
+            'input_dram': self.M_total * self.K_total,                    # M * K
+            'input_sram': torch.tensor(0.0, dtype=torch.float32),         # Full模板不使用SRAM缓存输入
+            'weight_dram': self.K_total * self.N_total * M1,              # K * N * M1  
+            'weight_sram': torch.tensor(0.0, dtype=torch.float32),        # Full模板不使用SRAM缓存权重
+            'output_dram': self.M_total * self.N_total,                   # M * N
+            'output_sram': torch.tensor(0.0, dtype=torch.float32),        # Full模板不使用SRAM缓存输出
+            # 兼容性保持
+            'input': self.M_total * self.K_total,
+            'weight': self.K_total * self.N_total * M1,
+            'output': self.M_total * self.N_total
         }
 
 
@@ -818,9 +825,16 @@ class DMT_GEMM_TiledK(DifferentiableMappingTemplate):
         M1 = self.get_M1()  # M / M0
         
         return {
-            'input': self.M_total * self.K_total,                    # M * K
-            'weight': self.K_total * self.N_total * M1,              # K * N * M1
-            'output': self.M_total * self.N_total                    # M * N
+            'input_dram': self.M_total * self.K_total,                    # M * K
+            'input_sram': torch.tensor(0.0, dtype=torch.float32),         # TiledK模板不使用SRAM缓存输入
+            'weight_dram': self.K_total * self.N_total * M1,              # K * N * M1
+            'weight_sram': torch.tensor(0.0, dtype=torch.float32),        # TiledK模板不使用SRAM缓存权重
+            'output_dram': self.M_total * self.N_total,                   # M * N
+            'output_sram': torch.tensor(0.0, dtype=torch.float32),        # TiledK模板不使用SRAM缓存输出
+            # 兼容性保持
+            'input': self.M_total * self.K_total,
+            'weight': self.K_total * self.N_total * M1,
+            'output': self.M_total * self.N_total
         }
 
 
@@ -927,9 +941,16 @@ class DMT_GEMM_TiledN(DifferentiableMappingTemplate):
         N1 = self.get_N1()  # N / N0
         
         return {
-            'input': self.M_total * self.K_total * N1,               # M * K * N1
-            'weight': self.K_total * self.N_total * M1,              # K * N * M1
-            'output': self.M_total * self.N_total                    # M * N
+            'input_dram': self.M_total * self.K_total * N1,               # M * K * N1
+            'input_sram': torch.tensor(0.0, dtype=torch.float32),         # TiledN模板不使用SRAM缓存输入
+            'weight_dram': self.K_total * self.N_total * M1,              # K * N * M1
+            'weight_sram': torch.tensor(0.0, dtype=torch.float32),        # TiledN模板不使用SRAM缓存权重
+            'output_dram': self.M_total * self.N_total,                   # M * N
+            'output_sram': torch.tensor(0.0, dtype=torch.float32),        # TiledN模板不使用SRAM缓存输出
+            # 兼容性保持
+            'input': self.M_total * self.K_total * N1,
+            'weight': self.K_total * self.N_total * M1,
+            'output': self.M_total * self.N_total
         }
 
 
@@ -1039,9 +1060,16 @@ class DMT_GEMM_TiledKN(DifferentiableMappingTemplate):
         N1 = self.get_N1()  # N / N0
         
         return {
-            'input': self.M_total * self.K_total * N1,               # M * K * N1
-            'weight': self.K_total * self.N_total * M1,              # K * N * M1
-            'output': self.M_total * self.N_total                    # M * N
+            'input_dram': self.M_total * self.K_total * N1,               # M * K * N1
+            'input_sram': torch.tensor(0.0, dtype=torch.float32),         # TiledKN模板不使用SRAM缓存输入
+            'weight_dram': self.K_total * self.N_total * M1,              # K * N * M1
+            'weight_sram': torch.tensor(0.0, dtype=torch.float32),        # TiledKN模板不使用SRAM缓存权重
+            'output_dram': self.M_total * self.N_total,                   # M * N
+            'output_sram': torch.tensor(0.0, dtype=torch.float32),        # TiledKN模板不使用SRAM缓存输出
+            # 兼容性保持
+            'input': self.M_total * self.K_total * N1,
+            'weight': self.K_total * self.N_total * M1,
+            'output': self.M_total * self.N_total
         }
 
 
@@ -1605,8 +1633,11 @@ class HardwareParameters(nn.Module):
     """
     Learnable hardware configuration parameters for joint hardware-software co-design.
     This enables the optimization of architectural choices alongside mapping and fusion decisions.
+    
+    ENHANCED FOR 40NM PROCESS: Now supports hierarchical memory system with separate
+    accumulator and scratchpad sizes for more accurate energy modeling.
     """
-    def __init__(self, initial_num_pes: int = 64, initial_buffer_size_kb: float = 256.0):
+    def __init__(self, initial_num_pes: int = 64, initial_accumulator_kb: float = 64.0, initial_scratchpad_kb: float = 192.0):
         super().__init__()
         
         # --- FIX: Add epsilon protection for log operations ---
@@ -1616,25 +1647,36 @@ class HardwareParameters(nn.Module):
         # Log-scale helps with gradient flow and ensures positive values
         # Ensure inputs are positive and add epsilon for numerical stability
         safe_num_pes = max(initial_num_pes, epsilon) + epsilon
-        safe_buffer_size = max(initial_buffer_size_kb, epsilon) + epsilon
+        safe_accumulator_size = max(initial_accumulator_kb, epsilon) + epsilon
+        safe_scratchpad_size = max(initial_scratchpad_kb, epsilon) + epsilon
         
         self.log_num_pes = nn.Parameter(torch.log(torch.tensor(safe_num_pes, dtype=torch.float32)))
-        self.log_buffer_size_kb = nn.Parameter(torch.log(torch.tensor(safe_buffer_size, dtype=torch.float32)))
+        self.log_accumulator_size_kb = nn.Parameter(torch.log(torch.tensor(safe_accumulator_size, dtype=torch.float32)))
+        self.log_scratchpad_size_kb = nn.Parameter(torch.log(torch.tensor(safe_scratchpad_size, dtype=torch.float32)))
         
         # Store initial values for reference
         self.initial_num_pes = initial_num_pes
-        self.initial_buffer_size_kb = initial_buffer_size_kb
+        self.initial_accumulator_kb = initial_accumulator_kb
+        self.initial_scratchpad_kb = initial_scratchpad_kb
     
     def get_num_pes(self) -> torch.Tensor:
         """Get the number of processing elements (differentiable)."""
         return torch.exp(self.log_num_pes)
     
+    def get_accumulator_size_kb(self) -> torch.Tensor:
+        """Get the accumulator size in KB (differentiable)."""
+        return torch.exp(self.log_accumulator_size_kb)
+    
+    def get_scratchpad_size_kb(self) -> torch.Tensor:
+        """Get the scratchpad size in KB (differentiable)."""
+        return torch.exp(self.log_scratchpad_size_kb)
+    
     def get_buffer_size_kb(self) -> torch.Tensor:
-        """Get the buffer size in KB (differentiable)."""
-        return torch.exp(self.log_buffer_size_kb)
+        """Get the total buffer size in KB (accumulator + scratchpad)."""
+        return self.get_accumulator_size_kb() + self.get_scratchpad_size_kb()
     
     def get_buffer_size_bytes(self) -> torch.Tensor:
-        """Get the buffer size in bytes (differentiable)."""
+        """Get the total buffer size in bytes (differentiable)."""
         return self.get_buffer_size_kb() * 1024.0
     
     def get_mac_throughput_gops(self) -> torch.Tensor:
@@ -1658,27 +1700,29 @@ class HardwareParameters(nn.Module):
     
     def get_area_cost(self) -> torch.Tensor:
         """
-        Calculate total chip area based on PEs and buffer size.
+        Calculate total chip area based on PEs and hierarchical buffer sizes.
         
         Returns:
             Total area in mm²
         """
         config = Config.get_instance()
         num_pes = self.get_num_pes()
-        buffer_size_kb = self.get_buffer_size_kb()
+        total_buffer_size_kb = self.get_buffer_size_kb()
         
         # Total area = base_area + PE_area + buffer_area
         area_cost = (
             torch.tensor(config.AREA_BASE_MM2, dtype=torch.float32) +
             num_pes * torch.tensor(config.AREA_PER_PE_MM2, dtype=torch.float32) +
-            buffer_size_kb * torch.tensor(config.AREA_PER_KB_SRAM_MM2, dtype=torch.float32)
+            total_buffer_size_kb * torch.tensor(config.AREA_PER_KB_SRAM_MM2, dtype=torch.float32)
         )
         return area_cost
     
     def __str__(self):
         lines = ["Hardware Parameters:"]
         lines.append(f"  Number of PEs: {self.get_num_pes().item():.1f}")
-        lines.append(f"  Buffer Size: {self.get_buffer_size_kb().item():.1f} KB")
+        lines.append(f"  Accumulator Size: {self.get_accumulator_size_kb().item():.1f} KB")
+        lines.append(f"  Scratchpad Size: {self.get_scratchpad_size_kb().item():.1f} KB")
+        lines.append(f"  Total Buffer Size: {self.get_buffer_size_kb().item():.1f} KB")
         lines.append(f"  MAC Throughput: {self.get_mac_throughput_gops().item():.1f} GOPS")
         lines.append(f"  Area Cost: {self.get_area_cost().item():.2f} mm²")
         return "\n".join(lines)
@@ -1786,7 +1830,8 @@ class ConditionalPerformanceModel(nn.Module):
     Models both performance and hardware costs of neural networks based on 
     mapping and fusion decisions. Implements analytical cost models from DOSA paper.
     
-    ENHANCED FOR 2025: Now supports both CNN and Transformer architectures.
+    ENHANCED FOR 40NM PROCESS: Now implements physics-based dynamic energy model
+    with hierarchical memory system (Registers, Accumulator, Scratchpad, DRAM).
     
     CNN Operators Supported:
     - Conv: Full convolution cost modeling with spatial kernels
@@ -1812,6 +1857,49 @@ class ConditionalPerformanceModel(nn.Module):
     """
     def __init__(self):
         super().__init__()
+    
+    def _get_dynamic_epa(self, hardware_params: HardwareParameters) -> dict:
+        """
+        根据新的40nm工艺公式计算各组件的动态EPA。
+        返回一个包含各级别EPA的字典，单位是 pJ。
+        
+        Args:
+            hardware_params: HardwareParameters对象，包含当前的硬件配置
+            
+        Returns:
+            包含各级别EPA的字典，单位是 pJ
+        """
+        # 从 hardware_params 获取实时、可微的硬件配置
+        num_pes = hardware_params.get_num_pes()
+        c1_kb = hardware_params.get_accumulator_size_kb()  # Level 1: Accumulator
+        c2_kb = hardware_params.get_scratchpad_size_kb()   # Level 2: Scratchpad
+
+        # 单位转换因子：从 µJ 转换为 pJ
+        UJ_TO_PJ = 1e6
+
+        # 计算各级别EPA (单位: pJ)
+        # PE: 一次乘加运算 (MAC) 的能耗
+        epa_pe = 0.561 * UJ_TO_PJ
+        
+        # Registers (Level 0): 访问一次寄存器的能耗
+        epa_reg = 0.487 * UJ_TO_PJ
+        
+        # Accumulator (Level 1): 动态公式，基于容量和PE数量
+        epa_acc = (1.94 + 0.1005 * (c1_kb / torch.sqrt(num_pes))) * UJ_TO_PJ
+        
+        # Scratchpad (Level 2): 动态公式，基于容量
+        epa_sp = (0.49 + 0.025 * c2_kb) * UJ_TO_PJ
+        
+        # DRAM (Level 3): 固定值
+        epa_dram = 100.0 * UJ_TO_PJ
+
+        return {
+            'pe': epa_pe,
+            'reg': epa_reg,
+            'acc': epa_acc,
+            'sp': epa_sp,
+            'dram': epa_dram
+        }
     
     def _calculate_compute_latency(self, total_macs: torch.Tensor, hardware_params: 'HardwareParameters') -> torch.Tensor:
         """
@@ -1848,13 +1936,14 @@ class ConditionalPerformanceModel(nn.Module):
     
     def _calculate_compute_energy(self, total_macs: torch.Tensor) -> torch.Tensor:
         """
-        Calculate energy consumed by MAC operations.
+        DEPRECATED: This method is deprecated in favor of the new dynamic energy model.
+        Use _get_dynamic_epa() method instead.
         
         Args:
             total_macs: Total number of multiply-accumulate operations
             
         Returns:
-            Compute energy in picojoules, with calibration factor applied
+            Compute energy in picojoules (legacy calculation)
         """
         config = Config.get_instance()
         compute_energy = total_macs * torch.tensor(config.MAC_ENERGY_PJ, dtype=torch.float32)
@@ -1863,48 +1952,48 @@ class ConditionalPerformanceModel(nn.Module):
     
     def _calculate_sram_energy(self, buffer_requirements: Dict[str, torch.Tensor], hardware_params: 'HardwareParameters') -> torch.Tensor:
         """
-        Calculate energy consumed by SRAM buffer accesses.
-        Uses dynamic energy scaling based on hardware buffer size.
+        DEPRECATED: This method is deprecated in favor of the new dynamic energy model.
+        Use _get_dynamic_epa() method instead.
         
         Args:
             buffer_requirements: Dictionary of buffer size requirements per dimension
             hardware_params: HardwareParameters object containing learnable buffer size
             
         Returns:
-            SRAM energy in picojoules, with calibration factor applied
+            SRAM energy in picojoules (legacy calculation)
         """
-        config = Config.get_instance()
-        buffer_size_bytes = hardware_params.get_buffer_size_bytes()
+        # Use the new dynamic EPA model instead of old config parameters
+        dynamic_epa = self._get_dynamic_epa(hardware_params)
         
-        # Calculate dynamic SRAM energy per access based on buffer size
-        sram_energy_per_access = (
-            torch.tensor(config.SRAM_BASE_COST, dtype=torch.float32) +
-            buffer_size_bytes * torch.tensor(config.SRAM_ENERGY_SCALING, dtype=torch.float32)
-        )
-        
-        # Calculate total SRAM energy based on buffer requirements
+        # Calculate total buffer accesses
         total_buffer_accesses = sum(buffer_requirements.values())
-        sram_energy = total_buffer_accesses * sram_energy_per_access
         
-        # Apply calibration factor for model tuning
-        return sram_energy * torch.tensor(config.SRAM_ENERGY_FACTOR, dtype=torch.float32)
+        # Use the new dynamic scratchpad EPA
+        sram_energy = total_buffer_accesses * dynamic_epa['sp']
+        
+        return sram_energy
     
     def _calculate_dram_energy(self, access_counts: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Calculate energy consumed by DRAM accesses.
+        DEPRECATED: This method is deprecated in favor of the new dynamic energy model.
+        Use _get_dynamic_epa() method instead.
         
         Args:
             access_counts: Dictionary of memory access counts per dimension
             
         Returns:
-            DRAM energy in picojoules, with calibration factor applied
+            DRAM energy in picojoules (legacy calculation)
         """
-        config = Config.get_instance()
+        # For legacy compatibility, we need hardware_params to get dynamic EPA
+        # Since this method doesn't have hardware_params, we'll use a default value
+        # This is a temporary fix - ideally this method should be removed
         total_dram_accesses = sum(access_counts.values())
-        dram_energy = total_dram_accesses * torch.tensor(config.DRAM_ACCESS_COST, dtype=torch.float32)
         
-        # Apply calibration factor for model tuning
-        return dram_energy * torch.tensor(config.DRAM_ENERGY_FACTOR, dtype=torch.float32)
+        # Use the fixed DRAM EPA from 40nm model (100 µJ = 100,000,000 pJ)
+        dram_epa = 100.0 * 1e6  # 100 µJ in pJ
+        dram_energy = total_dram_accesses * torch.tensor(dram_epa, dtype=torch.float32)
+        
+        return dram_energy
     
     def _calculate_noc_energy(self, layer_name: str, graph: ComputationGraph, is_fused: bool = False) -> torch.Tensor:
         """
@@ -2000,11 +2089,33 @@ class ConditionalPerformanceModel(nn.Module):
         # Final latency is max of compute and memory bound (roofline model)
         latency = torch.maximum(compute_latency, memory_latency)
         
-        # Calculate energy components using modular functions
-        compute_energy = self._calculate_compute_energy(total_macs)
-        sram_energy = self._calculate_sram_energy(buffer_requirements, hardware_params)
-        dram_energy = self._calculate_dram_energy(access_counts)
+        # Calculate energy components using new dynamic energy model
+        dynamic_epa = self._get_dynamic_epa(hardware_params)
+        
+        # Compute energy (PE operations)
+        compute_energy = total_macs * dynamic_epa['pe']
+        
+        # Register energy (simplified estimation)
+        register_accesses = total_macs * 2.0  # 2 accesses per MAC
+        register_energy = register_accesses * dynamic_epa['reg']
+        
+        # Accumulator energy (simplified estimation)
+        accumulator_accesses = total_macs
+        accumulator_energy = accumulator_accesses * dynamic_epa['acc']
+        
+        # Scratchpad energy (based on buffer requirements)
+        total_buffer_accesses = sum(buffer_requirements.values())
+        scratchpad_energy = total_buffer_accesses * dynamic_epa['sp']
+        
+        # DRAM energy (based on access counts)
+        total_dram_accesses = sum(access_counts.values())
+        dram_energy = total_dram_accesses * dynamic_epa['dram']
+        
+        # NoC energy (unchanged)
         noc_energy = self._calculate_noc_energy(layer_name, graph, is_fused)
+        
+        # Combine all energy components
+        sram_energy = register_energy + accumulator_energy + scratchpad_energy
         
         # --- FIX: Set physically reasonable lower bounds for all cost components ---
         # This prevents the model from predicting physically impossible zero costs
@@ -2129,19 +2240,46 @@ class ConditionalPerformanceModel(nn.Module):
             fusion_control_overhead = torch.tensor(config.FUSION_LATENCY_PENALTY_CYCLES, dtype=torch.float32)
             total_latency = total_latency + fusion_control_overhead
         
-        # === 5. 计算能耗 ===
-        # 5.1 计算能耗：基于各组件的能耗模型
-        compute_energy = self._calculate_compute_energy(total_macs)
-        sram_energy = self._calculate_sram_energy(max_buffer_requirements, hardware_params)
-        dram_energy = self._calculate_dram_energy(total_dram_accesses)
+        # === 5. 计算能耗：使用新的40nm工艺动态能耗模型 ===
+        # 5.1 获取动态EPA值
+        dynamic_epa = self._get_dynamic_epa(hardware_params)
         
-        # 5.2 计算 NoC 能耗（考虑融合的影响）
+        # 5.2 计算分级访存次数（需要从模板获取详细的分级访问信息）
+        # 注意：这里需要模板提供分级访问次数，暂时使用简化的估算
+        # TODO: 重构模板的get_access_counts方法以返回分级访问次数
+        
+        # 估算各级别的访问次数（基于当前模板的访问模式）
+        # 这是一个简化的实现，实际应该从模板获取精确的分级访问次数
+        total_accesses = sum(total_dram_accesses.values())
+        
+        # 简化的分级访问估算：
+        # - Registers: 假设每个MAC操作需要2次寄存器访问（读+写）
+        register_accesses = total_macs * 2.0
+        
+        # - Accumulator: 假设每个MAC操作需要1次累加器访问
+        accumulator_accesses = total_macs
+        
+        # - Scratchpad: 基于缓冲区需求估算
+        total_buffer_size = sum(max_buffer_requirements.values())
+        scratchpad_accesses = total_buffer_size * 2.0  # 读写各一次
+        
+        # - DRAM: 使用模板提供的DRAM访问次数
+        dram_accesses = total_accesses
+        
+        # 5.3 计算分级能耗
+        compute_energy = total_macs * dynamic_epa['pe']  # PE能耗
+        register_energy = register_accesses * dynamic_epa['reg']  # 寄存器能耗
+        accumulator_energy = accumulator_accesses * dynamic_epa['acc']  # 累加器能耗
+        scratchpad_energy = scratchpad_accesses * dynamic_epa['sp']  # 暂存器能耗
+        dram_energy = dram_accesses * dynamic_epa['dram']  # DRAM能耗
+        
+        # 5.4 计算 NoC 能耗（考虑融合的影响）
         noc_energy = torch.tensor(0.0, dtype=torch.float32)
         is_fused = len(group_layers) > 1
         for layer_name in group_layers:
             noc_energy = noc_energy + self._calculate_noc_energy(layer_name, graph, is_fused)
         
-        # 5.3 动态融合开销能耗（NEW: 基于映射策略的协同优化）
+        # 5.5 动态融合开销能耗（NEW: 基于映射策略的协同优化）
         fusion_overhead_energy = torch.tensor(0.0, dtype=torch.float32)
         if is_fused and is_fusion_calculation:
             # === 提取映射模板的Tiling因子（能耗版本）===
@@ -2180,8 +2318,9 @@ class ConditionalPerformanceModel(nn.Module):
             # 静态融合能耗开销（兼容性保持）
             fusion_overhead_energy = torch.tensor(config.FUSION_OVERHEAD_COST, dtype=torch.float32)
         
-        # 总能耗
-        total_energy = compute_energy + sram_energy + dram_energy + noc_energy + fusion_overhead_energy
+        # 总能耗：所有分级能耗的总和
+        total_energy = (compute_energy + register_energy + accumulator_energy + 
+                       scratchpad_energy + dram_energy + noc_energy + fusion_overhead_energy)
         
         # === 6. 数值稳定性检查 ===
         min_value = 1e-6
@@ -2189,6 +2328,82 @@ class ConditionalPerformanceModel(nn.Module):
         total_energy = torch.clamp(total_energy, min=min_value)
         
         return total_latency, total_energy
+
+    def _calculate_layer_cost_for_fusion(
+        self,
+        layer_name: str,
+        template_instance: DifferentiableMappingTemplate,
+        hardware_params: HardwareParameters,
+        graph: ComputationGraph,
+        position: str  # 'head', 'middle', 'tail'
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        计算融合链中单个层的延迟和能耗。
+        
+        严格遵循 Mind the Gap 论文的异构映射模板策略：
+        - 链头 (head): 输入来自DRAM，输出到SRAM
+        - 链中 (middle): 输入输出都在SRAM
+        - 链尾 (tail): 输入来自SRAM，输出到DRAM
+        
+        Args:
+            layer_name: 当前层的名称
+            template_instance: 根据位置严格指定的模板实例
+            hardware_params: 硬件参数
+            graph: 计算图
+            position: 层在链中的位置 ('head', 'middle', 'tail')
+            
+        Returns:
+            (layer_latency, layer_energy): 该层的延迟和能耗
+        """
+        config = Config.get_instance()
+        
+        # 1. 获取该模板下的 buffer 需求和分级访存次数
+        buffer_reqs = template_instance.get_buffer_requirements()
+        access_counts = template_instance.get_access_counts()
+        
+        # 2. 获取动态EPA值
+        dynamic_epas = self._get_dynamic_epa(hardware_params)
+        
+        # 3. 计算延迟 (简化版，可细化)
+        total_macs = calculate_macs(graph.layers[layer_name]['dims'], graph.layers[layer_name]['type'])
+        compute_latency = self._calculate_compute_latency(total_macs, hardware_params)
+        
+        # 内存延迟只考虑DRAM，因为SRAM访问被假设隐藏
+        dram_accesses = access_counts.get('input_dram', torch.tensor(0.0)) + \
+                       access_counts.get('weight_dram', torch.tensor(0.0)) + \
+                       access_counts.get('output_dram', torch.tensor(0.0))
+        memory_latency = dram_accesses * dynamic_epas['dram'] / (config.DRAM_BANDWIDTH * 1e9)
+        layer_latency = torch.maximum(compute_latency, memory_latency)
+        
+        # 4. 计算能耗（关键部分）
+        compute_energy = total_macs * dynamic_epas['pe']
+        weight_energy = torch.tensor(0.0, dtype=torch.float32)
+        io_energy = torch.tensor(0.0, dtype=torch.float32)
+        
+        # 根据位置决定 IO 能耗计算方式
+        if position == 'head':
+            # 输入来自DRAM，输出到SRAM
+            input_accesses = access_counts.get('input_dram', torch.tensor(0.0))
+            output_accesses = access_counts.get('output_sram', torch.tensor(0.0))
+            io_energy = input_accesses * dynamic_epas['dram'] + output_accesses * dynamic_epas['sp']
+        elif position == 'middle':
+            # 输入输出都在SRAM
+            input_accesses = access_counts.get('input_sram', torch.tensor(0.0))
+            output_accesses = access_counts.get('output_sram', torch.tensor(0.0))
+            io_energy = (input_accesses + output_accesses) * dynamic_epas['sp']
+        elif position == 'tail':
+            # 输入来自SRAM，输出到DRAM
+            input_accesses = access_counts.get('input_sram', torch.tensor(0.0))
+            output_accesses = access_counts.get('output_dram', torch.tensor(0.0))
+            io_energy = input_accesses * dynamic_epas['sp'] + output_accesses * dynamic_epas['dram']
+        
+        # 权重能耗（假设默认从DRAM读取）
+        weight_accesses = access_counts.get('weight_dram', torch.tensor(0.0))
+        weight_energy = weight_accesses * dynamic_epas['dram']
+        
+        layer_energy = compute_energy + weight_energy + io_energy
+        
+        return layer_latency, layer_energy
 
     def forward(
         self,
@@ -2263,26 +2478,53 @@ class ConditionalPerformanceModel(nn.Module):
                 # 这是一个融合组，需要考虑融合概率
                 p_fuse = fusion_params.get_fusion_probability(group_layers)
                 
-                # === ENHANCED: 为融合组重新计算成本，使用动态融合开销 ===
-                # 重新计算融合成本，但这次明确标记为融合计算，启用动态开销
+                # === 重构：使用异构映射模板策略计算融合成本 ===
+                # 严格遵循 Mind the Gap 论文的异构映射模板策略
                 fused_latency = torch.tensor(0.0, dtype=torch.float32)
                 fused_energy = torch.tensor(0.0, dtype=torch.float32)
                 
-                for i, (template_latency, template_energy) in enumerate(template_costs):
-                    # 获取对应的模板实例
-                    template_instance = decision_module.get_template_by_name(decision_module.template_names[i])
+                # 遍历融合组内的每一层，根据位置严格指定模板
+                for i, layer_name in enumerate(group_layers):
+                    # 确定层的位置
+                    if i == 0:
+                        position = 'head'  # 链头
+                    elif i == len(group_layers) - 1:
+                        position = 'tail'  # 链尾
+                    else:
+                        position = 'middle'  # 链中
                     
-                    # 使用动态融合开销重新计算成本
-                    fusion_aware_latency, fusion_aware_energy = self.calculate_group_costs(
-                        group_layers, template_instance, hardware_params, graph, 
-                        is_fusion_calculation=True  # 启用动态融合开销
+                    # 获取该层对应的决策模块
+                    layer_decision_module = mapping_params.get_decision_module_for_layer(layer_name)
+                    
+                    # 严格指定模板：根据位置规则直接获取指定的模板实例
+                    if position == 'head':
+                        # 链头：必须使用最灵活的 DMT_GEMM_TiledKN 模板
+                        template_instance = layer_decision_module.get_template_by_name('tiled_kn')
+                    elif position == 'middle':
+                        # 链中：必须使用最严格的 DMT_GEMM_Full 模板
+                        template_instance = layer_decision_module.get_template_by_name('full')
+                    elif position == 'tail':
+                        # 链尾：可以使用 DMT_GEMM_TiledN 模板
+                        # 特殊情况 (E=2): 对于只有两个算子的链，第二个算子也可以使用 TiledKN
+                        if len(group_layers) == 2:
+                            template_instance = layer_decision_module.get_template_by_name('tiled_kn')
+                        else:
+                            template_instance = layer_decision_module.get_template_by_name('tiled_n')
+                    
+                    # 计算该单层的成本
+                    layer_latency, layer_energy = self._calculate_layer_cost_for_fusion(
+                        layer_name, template_instance, hardware_params, graph, position
                     )
                     
-                    prob = template_probabilities[i]
-                    fused_latency = fused_latency + prob * fusion_aware_latency
-                    fused_energy = fused_energy + prob * fusion_aware_energy
+                    # 组合成本：这是最关键的一步
+                    # 延迟：融合链的总延迟由最慢的阶段决定，并累加上额外的开销
+                    fusion_overhead_per_layer = torch.tensor(10.0, dtype=torch.float32)  # 每层的融合开销
+                    fused_latency = torch.maximum(fused_latency, layer_latency) + fusion_overhead_per_layer
+                    
+                    # 能耗：能耗是累加的，但需要精确处理数据流
+                    fused_energy = fused_energy + layer_energy
                 
-                # 计算非融合成本：将组内各层视为独立单元
+                # 计算非融合成本：将组内各层视为独立单元（保持原有逻辑）
                 non_fused_latency = torch.tensor(0.0, dtype=torch.float32)
                 non_fused_energy = torch.tensor(0.0, dtype=torch.float32)
                 
@@ -2311,8 +2553,7 @@ class ConditionalPerformanceModel(nn.Module):
                     non_fused_latency = non_fused_latency + layer_latency
                     non_fused_energy = non_fused_energy + layer_energy
                 
-                # === CRITICAL: 基于专门为融合组优化的映射模板进行融合决策 ===
-                # 这是协同优化的核心：融合决策现在基于为该融合组特别优化的映射策略
+                # === 基于异构映射模板策略的融合决策 ===
                 final_group_latency = p_fuse * fused_latency + (1 - p_fuse) * non_fused_latency
                 final_group_energy = p_fuse * fused_energy + (1 - p_fuse) * non_fused_energy
             else:
@@ -2404,7 +2645,8 @@ def create_example_optimization_setup(graph: ComputationGraph) -> Tuple[MappingP
     # These will be jointly optimized with mapping and fusion decisions
     hardware_params = HardwareParameters(
         initial_num_pes=64,           # Start with 64 processing elements
-        initial_buffer_size_kb=256.0  # Start with 256 KB buffer
+        initial_accumulator_kb=64.0,  # Start with 64 KB accumulator
+        initial_scratchpad_kb=192.0   # Start with 192 KB scratchpad
     )
     
     return mapping_params, fusion_params, hardware_params
@@ -2441,7 +2683,7 @@ def calculate_total_loss_with_hardware_constraints(
     graph: ComputationGraph
 ) -> torch.Tensor:
     """
-    重构后的总损失函数：使用基于模板的约束。
+    重构后的总损失函数：使用基于模板的约束，移除面积项。
     
     Args:
         performance_model: 重构后的 ConditionalPerformanceModel 实例
@@ -2470,13 +2712,13 @@ def calculate_total_loss_with_hardware_constraints(
     epsilon = 1e-9
     log_latency = torch.log(latency + epsilon)
     log_energy = torch.log(energy + epsilon)
-    log_area = torch.log(area + epsilon)
+    # 移除面积项：log_area = torch.log(area + epsilon)
     
-    # 组合所有组件并加权
+    # 组合所有组件并加权（移除面积项）
     total_loss = (
         config.LATENCY_WEIGHT * log_latency + 
         config.ENERGY_WEIGHT * log_energy + 
-        config.AREA_WEIGHT * log_area +
+        # config.AREA_WEIGHT * log_area +  # 移除面积项
         config.PENALTY_WEIGHT * mapping_penalty +
         config.PENALTY_WEIGHT * template_constraint_penalty  # 新的模板约束惩罚
     )

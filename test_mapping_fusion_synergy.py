@@ -41,7 +41,7 @@ def test_mapping_fusion_synergy():
     # 创建参数
     mapping_params = MappingParameters(graph)
     fusion_params = FusionParameters(graph)
-    hardware_params = HardwareParameters(initial_num_pes=64, initial_buffer_size_kb=256.0)
+    hardware_params = HardwareParameters(initial_num_pes=64, initial_accumulator_kb=64.0, initial_scratchpad_kb=192.0)
     
     # 创建性能模型
     model = ConditionalPerformanceModel()
@@ -147,7 +147,7 @@ def test_dynamic_fusion_overhead():
     graph.add_fusion_group(['conv1', 'conv2'])
     
     mapping_params = MappingParameters(graph)
-    hardware_params = HardwareParameters(initial_num_pes=64, initial_buffer_size_kb=256.0)
+    hardware_params = HardwareParameters(initial_num_pes=64, initial_accumulator_kb=64.0, initial_scratchpad_kb=192.0)
     model = ConditionalPerformanceModel()
     
     # 获取融合组的决策模块

@@ -75,7 +75,7 @@ def test_template_constraints():
     
     graph = create_test_graph()
     mapping_params = MappingParameters(graph)
-    hardware_params = HardwareParameters(initial_num_pes=64, initial_buffer_size_kb=256.0)
+    hardware_params = HardwareParameters(initial_num_pes=64, initial_accumulator_kb=64.0, initial_scratchpad_kb=192.0)
     
     # 测试 tiling 因子惩罚
     penalty = calculate_penalty_loss(mapping_params)
@@ -94,7 +94,7 @@ def test_performance_model():
     graph = create_test_graph()
     mapping_params = MappingParameters(graph)
     fusion_params = FusionParameters(graph)
-    hardware_params = HardwareParameters(initial_num_pes=64, initial_buffer_size_kb=256.0)
+    hardware_params = HardwareParameters(initial_num_pes=64, initial_accumulator_kb=64.0, initial_scratchpad_kb=192.0)
     
     model = ConditionalPerformanceModel()
     

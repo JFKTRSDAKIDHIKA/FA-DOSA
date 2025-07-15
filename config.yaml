@@ -9,25 +9,29 @@ hardware:
   # Memory hierarchy
   num_memory_levels: 3  # 0: Registers, 1: Accumulator, 2: Scratchpad
 
+# === NEW: Technology node configuration ===
+technology:
+  node_nm: 40
+  source: "40nm process dynamic energy model"
+  description: "Dynamic energy model based on 40nm process technology with hierarchical memory system"
+
 # Cost model parameters
 costs:
-  # Energy costs (pJ/byte)
-  dram_access_cost_pj_byte: 2.5  # 10.0 / 4 bytes
-  sram_base_cost_pj_byte: 0.25   # 1.0 / 4 bytes
+  # Fusion overhead cost (pJ)
   fusion_overhead_cost_pj: 0.5
   
   # Area costs
   area_coefficient_mm2_per_kb: 0.0001  # Area per unit of buffer size
   
-  # Energy scaling
-  sram_energy_scaling_pj_byte_kb: 0.0001  # Energy increase per KB of buffer size
+  # Note: Old hardcoded energy parameters have been removed in favor of 
+  # the new 40nm process dynamic energy model implemented in the code
 
 # === NEW: Physics-aware loss function weights ===
 # These weights control how much the optimizer cares about different physical costs
 weights:
   # Performance and area weights
   latency_weight: 1.5              # Increased by 1.5x for stronger EDP focus
-  area_weight: 0.0                 # Set to zero to ignore area cost
+  area_weight: 0.0                 # Set to one to enable area cost
   
   # === ENERGY WEIGHTS: Now decomposed by physical cost ===
   # These separate weights allow fine-grained control over optimization priorities
@@ -61,8 +65,11 @@ fusion:
   data_management_energy_per_layer: 0.1  # Energy per layer for managing fused data
 
 # === NEW: Compute energy parameters ===
+# Note: MAC energy is now calculated dynamically based on 40nm process model
+# in the _get_dynamic_epa method (0.561 µJ per MAC operation)
 compute:
-  mac_energy_pj: 0.1               # Energy per MAC operation in picojoules
+  # This section is kept for compatibility but values are now calculated dynamically
+  mac_energy_pj: 0.1               # Legacy parameter (not used in new model)
 
 # === NEW: Hardware Design Space Exploration parameters ===
 hardware_dse:
@@ -77,4 +84,4 @@ area_model:
 
 # Problem dimensions
 dimensions:
-  loop_dims: ['R', 'S', 'P', 'Q', 'C', 'K', 'N']  # Loop dimensions from DOSA paper 
+  loop_dims: ['R', 'S', 'P', 'Q', 'C', 'K', 'N']  # Loop dimensions from DOSA paper

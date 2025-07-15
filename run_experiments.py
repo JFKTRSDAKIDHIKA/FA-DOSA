@@ -403,7 +403,7 @@ def authoritative_evaluation_model(final_params: dict, graph: 'ComputationGraph'
         'final_area': area.item(),
     }
 
-def run_fadose_experiment(graph: ComputationGraph, config: Config, num_iterations=2000, lr=1e-3, workload: str = None, trial_num: int = None) -> dict:
+def run_fadose_experiment(graph: ComputationGraph, config: Config, num_iterations=100, lr=1e-3, workload: str = None, trial_num: int = None) -> dict:
     """
     🚀 FA-DOSA Co-optimization Experiment
     """
@@ -422,7 +422,7 @@ def run_fadose_experiment(graph: ComputationGraph, config: Config, num_iteration
         total_loss = calculate_total_loss_with_hardware_constraints(performance_model, mapping_params, fusion_params, hardware_params, graph)
         total_loss.backward()
         optimizer.step()
-        if i % 200 == 0:
+        if i % 20 == 0:
             print(f"    Epoch {i}/{num_iterations}, Loss: {total_loss.item():.4f}")
     print("\n   [🏛️ Authoritative Evaluation] Initiating unified final performance assessment...")
     final_params = {'mapping_params': mapping_params, 'fusion_params': fusion_params, 'hardware_params': hardware_params}
@@ -439,7 +439,7 @@ def run_fadose_experiment(graph: ComputationGraph, config: Config, num_iteration
     }
     return authoritative_results
 
-def run_fadose_constrained_experiment(graph: ComputationGraph, config: Config, num_iterations=1000, lr=1e-3, workload: str = None, trial_num: int = None) -> dict:
+def run_fadose_constrained_experiment(graph: ComputationGraph, config: Config, num_iterations=50, lr=1e-3, workload: str = None, trial_num: int = None) -> dict:
     """
     FA-DOSA with fixed hardware.
     """
@@ -450,7 +450,9 @@ def run_fadose_constrained_experiment(graph: ComputationGraph, config: Config, n
         initial_area = hardware_params.get_area_cost().item()
         scaling_factor = (target_area / initial_area) ** 0.5 if initial_area > 0 else 1.0
         hardware_params.log_num_pes.data *= scaling_factor
-        hardware_params.log_buffer_size_kb.data *= scaling_factor
+        # Scale both accumulator and scratchpad sizes proportionally
+        hardware_params.log_accumulator_size_kb.data *= scaling_factor
+        hardware_params.log_scratchpad_size_kb.data *= scaling_factor
     for param in hardware_params.parameters():
         param.requires_grad = False
     print(f"  [CONSTRAINED] Target area: {target_area:.2f} mm²")
@@ -466,7 +468,7 @@ def run_fadose_constrained_experiment(graph: ComputationGraph, config: Config, n
         )
         loss.backward()
         optimizer.step()
-        if i % 200 == 0:
+        if i % 10 == 0:
             print(f"    Epoch {i}/{num_iterations}, Loss: {loss.item():.4f}")
     final_params = {'mapping_params': mapping_params, 'fusion_params': fusion_params, 'hardware_params': hardware_params}
     authoritative_results = authoritative_evaluation_model(final_params, graph, config)
@@ -481,7 +483,7 @@ def run_fadose_constrained_experiment(graph: ComputationGraph, config: Config, n
     return authoritative_results
 
 
-def run_random_search_experiment(graph: ComputationGraph, config: Config, num_samples=1000) -> dict:
+def run_random_search_experiment(graph: ComputationGraph, config: Config, num_samples=50) -> dict:
     """
     Random search baseline experiment.
     Randomly samples mapping and fusion parameters to find the best configuration.
@@ -505,9 +507,15 @@ def run_random_search_experiment(graph: ComputationGraph, config: Config, num_sa
         # Generate random parameters
         mapping_params = MappingParameters(graph)
         fusion_params = FusionParameters(graph)
+        # Split buffer size into accumulator and scratchpad
+        total_buffer_size = np.random.randint(64, 4097)
+        accumulator_size = total_buffer_size // 4  # 25% for accumulator
+        scratchpad_size = total_buffer_size - accumulator_size  # 75% for scratchpad
+        
         hardware_params = HardwareParameters(
             initial_num_pes=np.random.randint(16, 1025),
-            initial_buffer_size_kb=np.random.randint(64, 4097)
+            initial_accumulator_kb=accumulator_size,
+            initial_scratchpad_kb=scratchpad_size
         )
         
         # Randomize mapping parameters (template parameters)
@@ -558,7 +566,7 @@ def run_random_search_experiment(graph: ComputationGraph, config: Config, num_sa
                     'hardware': hardware_params,
                 }
                 
-            if sample % 200 == 0 and sample > 0:
+            if sample % 10 == 0 and sample > 0:
                 print(f"  Sample {sample}/{num_samples}: Best loss so far = {best_loss:.4f}")
                     
         except Exception as e:
@@ -616,9 +624,9 @@ def run_decoupled_sota_experiment(graph: ComputationGraph, config: Config) -> di
     # === Step 1: Discrete Hardware Design Space Exploration ===
     print("  Step 1: Comprehensive Hardware DSE")
     
-    # Define realistic discrete hardware search space
-    buffer_sizes_kb = [128, 256, 512, 1024]  # KB
-    pe_counts = [64, 128, 256, 512]  # Number of processing elements
+    # Define realistic discrete hardware search space (reduced for debugging)
+    buffer_sizes_kb = [256, 512]  # KB
+    pe_counts = [128, 256]  # Number of processing elements
     
     best_hw_config = None
     best_hw_edp = float('inf')
@@ -636,14 +644,20 @@ def run_decoupled_sota_experiment(graph: ComputationGraph, config: Config) -> di
             
             # Create a fixed hardware configuration for this iteration
             # Use mock HardwareParameters to represent fixed hardware choice
+            # Split buffer size into accumulator and scratchpad
+            accumulator_size = buffer_size_kb // 4  # 25% for accumulator
+            scratchpad_size = buffer_size_kb - accumulator_size  # 75% for scratchpad
+            
             mock_hardware_params = HardwareParameters(
                 initial_num_pes=pe_count,
-                initial_buffer_size_kb=buffer_size_kb
+                initial_accumulator_kb=accumulator_size,
+                initial_scratchpad_kb=scratchpad_size
             )
             # Fix the parameters to prevent learning (simulate fixed hardware)
             with torch.no_grad():
                 mock_hardware_params.log_num_pes.requires_grad_(False)
-                mock_hardware_params.log_buffer_size_kb.requires_grad_(False)
+                mock_hardware_params.log_accumulator_size_kb.requires_grad_(False)
+                mock_hardware_params.log_scratchpad_size_kb.requires_grad_(False)
             
             # === Mapping optimization for this fixed hardware ===
             mapping_params = MappingParameters(graph)
@@ -652,7 +666,7 @@ def run_decoupled_sota_experiment(graph: ComputationGraph, config: Config) -> di
             # Optimizer only for mapping (hardware is fixed)
             optimizer = optim.Adam(mapping_params.parameters(), lr=0.01)
             
-            num_epochs_mapping = 100  # Focused optimization for each hardware config
+            num_epochs_mapping = 20  # Focused optimization for each hardware config (reduced for debugging)
             
             for epoch in range(num_epochs_mapping):
                 optimizer.zero_grad()
@@ -856,15 +870,25 @@ def run_twostep_baseline_experiment(graph: ComputationGraph, config: Config) -> 
     model = ConditionalPerformanceModel() # Needed for _calculate_analytical_costs
     
     # Create a mock hardware configuration for this baseline (simulates old fixed hardware approach)
-    mock_hardware_params = HardwareParameters(initial_num_pes=256, initial_buffer_size_kb=512)
+    # Split buffer size into accumulator and scratchpad
+    total_buffer_size = 512
+    accumulator_size = total_buffer_size // 4  # 25% for accumulator
+    scratchpad_size = total_buffer_size - accumulator_size  # 75% for scratchpad
+    
+    mock_hardware_params = HardwareParameters(
+        initial_num_pes=256, 
+        initial_accumulator_kb=accumulator_size,
+        initial_scratchpad_kb=scratchpad_size
+    )
     with torch.no_grad():
         mock_hardware_params.log_num_pes.requires_grad_(False)
-        mock_hardware_params.log_buffer_size_kb.requires_grad_(False)
+        mock_hardware_params.log_accumulator_size_kb.requires_grad_(False)
+        mock_hardware_params.log_scratchpad_size_kb.requires_grad_(False)
     
     # Optimizer only for mapping parameters (fusion-agnostic)
     optimizer = optim.Adam(mapping_params.parameters(), lr=0.01)
     
-    num_epochs_step1 = 150 # Shorter loop for this baseline step
+    num_epochs_step1 = 30 # Shorter loop for this baseline step (reduced for debugging)
     for epoch in range(num_epochs_step1):
         optimizer.zero_grad()
         
@@ -906,7 +930,7 @@ def run_twostep_baseline_experiment(graph: ComputationGraph, config: Config) -> 
     fusion_params = FusionParameters(graph)
     fusion_optimizer = optim.Adam(fusion_params.parameters(), lr=0.01) # Changed lr_fusion to 0.01
     
-    num_epochs_fusion = 100 # Changed num_epochs_fusion to 100
+    num_epochs_fusion = 20 # Changed num_epochs_fusion to 20 (reduced for debugging)
     for epoch in range(num_epochs_fusion):
         fusion_optimizer.zero_grad()
         
@@ -931,7 +955,7 @@ def run_twostep_baseline_experiment(graph: ComputationGraph, config: Config) -> 
         fusion_loss.backward()
         fusion_optimizer.step()
 
-        if epoch % 200 == 0:
+        if epoch % 5 == 0:
             print(f"    Fusion Epoch {epoch}/{num_epochs_fusion}, Loss: {fusion_loss.item():.4f}")
     
     print(f"  Two-Step Baseline finished. Final fusion loss: {fusion_loss.item():.4f}")
