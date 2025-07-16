@@ -467,6 +467,9 @@ def parse_onnx_to_graph(onnx_model_path: str) -> ComputationGraph:
     print(f"  Detected {fusion_count} fusion opportunities")
     print(f"\nParsing complete: {len(graph_nodes.layers)} layers, {len(graph_nodes.edges)} edges, {len(graph_nodes.fusion_groups)} fusion groups")
     
+    # Call the new method to identify and register fusion groups
+    graph_nodes.identify_and_register_fusion_groups()
+    
     return graph_nodes
 
 def main():
@@ -514,4 +517,4 @@ def main():
         traceback.print_exc()
 
 if __name__ == "__main__":
-    main() 
+    main()

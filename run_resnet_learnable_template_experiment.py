@@ -1,55 +1,108 @@
-# [CURSOR_START]
 import os
 import time
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+import json
 from typing import Dict, Tuple, List, Any
+from functools import reduce
+from operator import mul
 
-# --- Prerequisite: Assuming necessary classes are available ---
-# Stubs for Config, HardwareParameters, FusionParameters, etc. are included for completeness.
+# --- Task 1: Differentiable Integer Projection Utilities ---
+
+# Memoization cache for divisors
+_divisors_cache = {}
+
+def get_divisors(n: int) -> torch.Tensor:
+    """
+    Get all integer divisors of n as a sorted torch.Tensor.
+    Results are memoized to avoid re-computation.
+    """
+    if n in _divisors_cache:
+        return _divisors_cache[n]
+    
+    divisors = []
+    for i in range(1, int(n**0.5) + 1):
+        if n % i == 0:
+            divisors.append(i)
+            if i != n // i:
+                divisors.append(n // i)
+    
+    divisors.sort()
+    divisors_tensor = torch.tensor(divisors, dtype=torch.float32)
+    _divisors_cache[n] = divisors_tensor
+    return divisors_tensor
+
+class ProjectToNearestDivisor(torch.autograd.Function):
+    """
+    Straight-Through Estimator for projecting continuous factors to valid integer divisors.
+    Forward pass: discrete projection to nearest valid divisor
+    Backward pass: pass gradients through unchanged
+    """
+    @staticmethod
+    def forward(ctx, continuous_factor, problem_dim):
+        # Get valid divisors for the problem dimension
+        valid_divisors = get_divisors(int(problem_dim.item()))
+        
+        # Find the closest divisor to the continuous factor
+        distances = torch.abs(valid_divisors - continuous_factor)
+        closest_idx = torch.argmin(distances)
+        projected_factor = valid_divisors[closest_idx]
+        
+        return projected_factor
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Straight-through estimator: pass gradient unchanged for continuous_factor
+        # Ensure grad_output has the correct shape
+        if grad_output.dim() == 0:
+            grad_output = grad_output.unsqueeze(0)
+        # Return None for problem_dim as it doesn't need gradients
+        return grad_output, None
+
+# --- 核心思想 ---
+# 本次重构旨在打破三大简化假设，构建一个更高保真度的FA-DOSA框架：
+# 1. 显式的多级存储层次（Memory Hierarchy）：在Config中定义，包括各级Buffer。
+# 2. 细粒度的映射参数化（Fine-grained Mapping）：为每个存储层的每个计算维度定义独立的、区分空间/时间的Tiling因子。
+# 3. 更精确的性能模型（Fidelity-Enhanced Performance Model）：能够根据细粒度的映射，计算多级存储间的访问成本。
 
 class Config:
+    """全局配置类，已更新为支持多级存储层次结构。"""
     _instance = None
     def __init__(self):
         self.BYTES_PER_ELEMENT = 4
-        self.DRAM_BANDWIDTH_GB_S = 128
         self.CLOCK_FREQUENCY_MHZ = 1000
         
-        # --- 基于40nm工艺的Energy Per Access (EPA) 数据表 ---
-        # 单位: μJ (微焦耳) -> 转换为 pJ (皮焦耳) 用于计算
+        # --- NEW: 定义显式的多级存储层次 ---
+        self.MEMORY_HIERARCHY = [
+            # level 0: 虚拟层，代表PE内部的计算
+            {'name': 'PE', 'type': 'compute'},
+            # level 1: 最内层存储，例如Register File
+            {'name': 'L1_Registers', 'type': 'buffer', 'size_kb': nn.Parameter(torch.log(torch.tensor(32.0)))},
+            # level 2: 中间层存储，例如Scratchpad
+            {'name': 'L2_Scratchpad', 'type': 'buffer', 'size_kb': nn.Parameter(torch.log(torch.tensor(256.0)))},
+            # level 3: 主存
+            {'name': 'L3_DRAM', 'type': 'dram', 'bandwidth_gb_s': 128}
+        ]
         
-        # PE: 一次乘加运算 (MAC) 的能耗
-        self.PE_MAC_EPA_PJ = 0.561 * 1e6  # 0.561 μJ -> 561000 pJ
+        # 能量模型（单位：pJ）
+        self.PE_MAC_EPA_PJ = 0.561 * 1e6
+        # 单位能耗（pJ/access），假设一个access为32-bit (4 bytes)
+        self.L1_REG_BASE_EPA_PJ = 0.487 * 1e6 
+        self.L2_SPM_BASE_EPA_PJ = 0.49 * 1e6
+        self.L2_SPM_CAPACITY_COEFF_PJ_PER_KB = 0.025 * 1e6
+        self.L3_DRAM_EPA_PJ = 100 * 1e6
         
-        # Registers: 访问一次寄存器的能耗
-        self.REGISTER_EPA_PJ = 0.487 * 1e6  # 0.487 μJ -> 487000 pJ
-        
-        # Accumulator: 容量相关的能耗公式
-        # EPA = 1.94 + 0.1005 × (C₁ / √CPE) μJ
-        # 其中 C₁ 是accumulator容量，CPE是每个PE的容量
-        self.ACCUMULATOR_BASE_EPA_PJ = 1.94 * 1e6  # 1.94 μJ -> 1940000 pJ
-        self.ACCUMULATOR_CAPACITY_COEFF_PJ = 0.1005 * 1e6  # 0.1005 μJ -> 100500 pJ
-        
-        # Scratchpad: 容量相关的能耗公式
-        # EPA = 0.49 + 0.025 × C₂ μJ
-        # 其中 C₂ 是scratchpad容量 (KB)
-        self.SCRATCHPAD_BASE_EPA_PJ = 0.49 * 1e6  # 0.49 μJ -> 490000 pJ
-        self.SCRATCHPAD_CAPACITY_COEFF_PJ_PER_KB = 0.025 * 1e6  # 0.025 μJ/KB -> 25000 pJ/KB
-        
-        # DRAM: 访问一次DRAM的能耗
-        self.DRAM_EPA_PJ = 100 * 1e6  # 100 μJ -> 100000000 pJ
-        
-        # 硬件配置参数
-        self.ACCUMULATOR_CAPACITY_PER_PE_KB = 0.5  # 每个PE的accumulator容量 (KB)
-        self.REGISTER_CAPACITY_PER_PE_KB = 0.1     # 每个PE的register容量 (KB)
-        
+        # 面积模型参数
         self.AREA_PER_PE_MM2 = 0.015
-        self.AREA_PER_KB_SRAM_MM2 = 0.005
+        self.AREA_PER_KB_L1_MM2 = 0.008 # L1通常更贵
+        self.AREA_PER_KB_L2_MM2 = 0.005 # L2相对便宜
         self.AREA_BASE_MM2 = 1.0
-        self.PENALTY_WEIGHT = 1e5
+        self.PENALTY_WEIGHT = 1e6
+
     @staticmethod
     def get_instance():
         if Config._instance is None:
@@ -57,22 +110,105 @@ class Config:
         return Config._instance
 
 class HardwareParameters(nn.Module):
-    def __init__(self, initial_num_pes=64, initial_buffer_kb=128):
+    """硬件参数，现在支持多级Buffer。"""
+    def __init__(self, initial_num_pes=128.0, initial_l1_kb=32.0, initial_l2_kb=256.0):
         super().__init__()
         self.log_num_pes = nn.Parameter(torch.log(torch.tensor(float(initial_num_pes))))
-        self.log_buffer_size_kb = nn.Parameter(torch.log(torch.tensor(float(initial_buffer_kb))))
+        
+        # NEW: 为每个可学习的Buffer创建一个参数
+        self.log_buffer_sizes_kb = nn.ParameterDict({
+            'L1_Registers': nn.Parameter(torch.log(torch.tensor(float(initial_l1_kb)))),
+            'L2_Scratchpad': nn.Parameter(torch.log(torch.tensor(float(initial_l2_kb))))
+        })
+        
     def get_num_pes(self):
         return torch.exp(self.log_num_pes)
-    def get_buffer_size_kb(self):
-        return torch.exp(self.log_buffer_size_kb)
-    def get_buffer_size_bytes(self):
-        return self.get_buffer_size_kb() * 1024
+
+    def get_projected_num_pes(self):
+        continuous_pes = self.get_num_pes()
+        projected_num_pes = torch.round(torch.sqrt(continuous_pes)) ** 2
+        return continuous_pes + (projected_num_pes - continuous_pes).detach()
+        
+    def get_buffer_size_kb(self, level_name: str):
+        return torch.exp(self.log_buffer_sizes_kb[level_name])
+        
     def get_area_cost(self):
         config = Config.get_instance()
-        return (config.AREA_BASE_MM2 +
-                self.get_num_pes() * config.AREA_PER_PE_MM2 +
-                self.get_buffer_size_kb() * config.AREA_PER_KB_SRAM_MM2)
+        pe_area = self.get_num_pes() * config.AREA_PER_PE_MM2
+        l1_area = self.get_buffer_size_kb('L1_Registers') * config.AREA_PER_KB_L1_MM2
+        l2_area = self.get_buffer_size_kb('L2_Scratchpad') * config.AREA_PER_KB_L2_MM2
+        return config.AREA_BASE_MM2 + pe_area + l1_area + l2_area
 
+class FineGrainedMapping(nn.Module):
+    """
+    NEW: 细粒度的映射参数化模块，替代了旧的LearnableConvReluTemplate。
+    """
+    def __init__(self, problem_dims: Dict[str, int], hierarchy: List[Dict]):
+        super().__init__()
+        self.dims = problem_dims
+        self.hierarchy = hierarchy
+        
+        # 创建一个嵌套的参数字典来存储所有tiling因子
+        # 结构: self.factors[level_name][dim_name]['temporal' or 'spatial']
+        self.factors = nn.ModuleDict()
+
+        # 只为片上存储（on-chip buffers）创建可学习的参数
+        on_chip_levels = [level['name'] for level in hierarchy if level['type'] == 'buffer']
+        
+        for level_name in on_chip_levels:
+            self.factors[level_name] = nn.ModuleDict()
+            for dim_name in self.dims.keys():
+                # 使用ParameterDict来正确注册参数
+                # 初始化为1（在log空间中为0）
+                self.factors[level_name][dim_name] = nn.ParameterDict({
+                    'temporal': nn.Parameter(torch.zeros(1)), # log(1) = 0
+                    'spatial': nn.Parameter(torch.zeros(1))
+                })
+
+    def get_factor(self, level_name, dim_name, factor_type):
+        """获取指定level, dim, type的tiling因子。"""
+        return torch.clamp(torch.exp(self.factors[level_name][dim_name][factor_type]), min=1.0)
+
+    def get_all_factors(self):
+        """
+        NEW: Returns physically valid, integer tiling factors using differentiable projection.
+        This method replaces get_all_factors() for performance evaluation.
+        """
+        projected_factors = {}
+        on_chip_levels = [level['name'] for level in self.hierarchy if level['type'] == 'buffer']
+
+        for dim_name, total_size in self.dims.items():
+            projected_factors[dim_name] = {}
+            product_of_on_chip_factors = 1.0
+            
+            # Project on-chip factors to valid integer divisors
+            for level_name in on_chip_levels:
+                continuous_temporal = self.get_factor(level_name, dim_name, 'temporal')
+                continuous_spatial = self.get_factor(level_name, dim_name, 'spatial')
+                
+                # Apply differentiable projection
+                problem_dim_tensor = torch.tensor(float(total_size))
+                projected_temporal = ProjectToNearestDivisor.apply(continuous_temporal, problem_dim_tensor)
+                projected_spatial = ProjectToNearestDivisor.apply(continuous_spatial, problem_dim_tensor)
+                
+                projected_factors[dim_name][level_name] = {
+                    'temporal': projected_temporal,
+                    'spatial': projected_spatial
+                }
+                product_of_on_chip_factors *= projected_temporal * projected_spatial
+
+            # 推导DRAM层的temporal因子以满足约束
+            dram_level_name = next(level['name'] for level in self.hierarchy if level['type'] == 'dram')
+            dram_temporal_factor = total_size / product_of_on_chip_factors
+            projected_dram_temporal = ProjectToNearestDivisor.apply(dram_temporal_factor, problem_dim_tensor)
+
+            projected_factors[dim_name][dram_level_name] = {
+                'temporal': projected_dram_temporal,
+                'spatial': torch.tensor(1.0) # DRAM层没有空间并行
+            }
+        return projected_factors
+        
+# --- 其他类保持不变，但它们的调用方式会被新模型改变 ---
 class FusionParameters(nn.Module):
     def __init__(self, graph):
         super().__init__()
@@ -89,371 +225,234 @@ class ComputationGraph:
         self.layers = {}
         self.edges = []
         self.fusion_groups = []
-    def add_layer(self, name, dims, type):
-        self.layers[name] = {'dims': dims, 'type': type}
-    def add_edge(self, src, dest):
-        self.edges.append((src, dest))
+        self.problem_dims = {'N':1, 'C':1, 'K':1, 'P':1, 'Q':1, 'R':1, 'S':1}
+    def add_layer(self, name, dims, op_type):
+        self.layers[name] = {'dims': dims, 'type': op_type}
+        for d, v in dims.items():
+            self.problem_dims[d] = max(self.problem_dims[d], v)
     def add_fusion_group(self, group):
         self.fusion_groups.append(group)
 
-def parse_onnx_to_graph(path):
+# ... parse_onnx_to_graph 和 calculate_macs 保持不变 ...
+def parse_onnx_to_graph(path): # Task 2: Enable True Multi-Layer Fusion Groups
     graph = ComputationGraph()
-    for i in range(8):
+    for i in range(2): # 简化为2个group以加速
+        # Add individual layers to graph.layers
         dims_conv = {'N': 1, 'C': 64*(2**(i//2)), 'K': 64*(2**(i//2)), 'P': 56//(2**(i//2)), 'Q': 56//(2**(i//2)), 'R': 3, 'S': 3}
-        dims_relu = {k:v for k,v in dims_conv.items() if k not in ['C', 'R', 'S']}
-        conv_name = f'conv_{i}'
-        relu_name = f'relu_{i}'
-        graph.add_layer(conv_name, dims_conv, 'Conv')
-        graph.add_layer(relu_name, dims_relu, 'ReLU')
-        graph.add_edge(conv_name, relu_name)
-        graph.add_fusion_group([conv_name, relu_name])
+        dims_relu = dims_conv.copy()  # ReLU has same dimensions as conv output
+        
+        graph.add_layer(f'conv_{i}', dims_conv, 'Conv')
+        graph.add_layer(f'relu_{i}', dims_relu, 'ReLU')
+        
+        # NEW: Create multi-layer fusion groups (producer-consumer pairs)
+        graph.add_fusion_group([f'conv_{i}', f'relu_{i}'])
+        
+        # NEW: Preserve single-layer (no-fusion) options
+        graph.add_fusion_group([f'conv_{i}'])
+        graph.add_fusion_group([f'relu_{i}'])
     return graph
 
-def calculate_macs(dims, op_type):
-    return torch.tensor(float(dims.get('N', 1) * dims.get('K', 1) * dims.get('C', 1) * dims.get('P', 1) * dims.get('Q', 1) * dims.get('R', 1) * dims.get('S', 1)))
+def calculate_macs(dims):
+    return reduce(mul, dims.values(), 1.0)
 
-class DifferentiableMappingTemplate(nn.Module):
-    def __init__(self, dims: Dict[str, int]):
-        super().__init__()
-        self.dims = dims
-        self.config = Config.get_instance()
-        self._init_template_parameters()
-    def _init_template_parameters(self): pass
-    def get_M0(self) -> torch.Tensor: raise NotImplementedError
-    def get_K0(self) -> torch.Tensor: raise NotImplementedError
-    def get_N0(self) -> torch.Tensor: raise NotImplementedError
-    def get_buffer_requirements(self) -> Dict[str, torch.Tensor]: raise NotImplementedError
-    def get_access_counts(self, is_fused: bool) -> Dict[str, torch.Tensor]: raise NotImplementedError
 
-class LearnableConvReluTemplate(DifferentiableMappingTemplate):
-    def __init__(self, dims: Dict[str, int]):
-        super().__init__(dims)
-    def _init_template_parameters(self):
-        M_total = self.dims.get('N', 1) * self.dims.get('P', 1) * self.dims.get('Q', 1)
-        K_total = self.dims.get('C', 1)
-        N_total = self.dims.get('K', 1)
-        self.log_M0 = nn.Parameter(torch.log(torch.sqrt(torch.tensor(float(M_total)))))
-        self.log_K0 = nn.Parameter(torch.log(torch.sqrt(torch.tensor(float(K_total)))))
-        self.log_N0 = nn.Parameter(torch.log(torch.sqrt(torch.tensor(float(N_total)))))
-    def get_M0(self) -> torch.Tensor: return torch.exp(self.log_M0)
-    def get_K0(self) -> torch.Tensor: return torch.exp(self.log_K0)
-    def get_N0(self) -> torch.Tensor: return torch.exp(self.log_N0)
-    def get_buffer_requirements(self) -> Dict[str, torch.Tensor]:
-        M0, K0, N0 = self.get_M0(), self.get_K0(), self.get_N0()
-        return {'input': M0 * K0 * self.config.BYTES_PER_ELEMENT, 'weight': K0 * N0 * self.config.BYTES_PER_ELEMENT, 'output': M0 * N0 * self.config.BYTES_PER_ELEMENT}
-    def get_access_counts(self, is_fused: bool) -> Dict[str, torch.Tensor]:
-        M0, K0, N0 = self.get_M0(), self.get_K0(), self.get_N0()
-        M_total, K_total, N_total = self.dims.get('N', 1)*self.dims.get('P', 1)*self.dims.get('Q', 1), self.dims.get('C', 1), self.dims.get('K', 1)
-        M1, K1, N1 = M_total / M0, K_total / K0, N_total / N0
-        input_access, weight_access, output_access = M_total*K_total*N1, K_total*N_total*M1, M_total*N_total
-        return {'input': input_access, 'weight': weight_access, 'output': output_access * (1 if is_fused else 2)}
-
-class MappingParameters(nn.Module):
-    def __init__(self, graph: ComputationGraph):
-        super().__init__()
-        self.expert_templates = {}
-        for group in graph.fusion_groups:
-            if len(group) == 2 and graph.layers[group[0]]['type'] == 'Conv' and graph.layers[group[1]]['type'] == 'ReLU':
-                template = LearnableConvReluTemplate(graph.layers[group[0]]['dims'])
-                self.expert_templates['__'.join(sorted(group))] = template
-                # Register the template as a submodule so its parameters are tracked
-                self.add_module(f'template_{len(self.expert_templates)}', template)
-    def get_expert_template(self, group: List[str]):
-        return self.expert_templates.get('__'.join(sorted(group)))
-    def parameters(self):
-        params = []
-        for template in self.expert_templates.values():
-            params.extend(template.parameters())
-        return iter(params)
-
-class RealisticPerformanceModel(nn.Module):
+class HighFidelityPerformanceModel(nn.Module):
+    """
+    NEW: 高保真性能模型，能够处理多级存储和细粒度映射。
+    """
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-    def forward(self, graph: ComputationGraph, hardware_params: HardwareParameters, fusion_params: FusionParameters, mapping_params: MappingParameters) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    def forward(self, graph: ComputationGraph, hw_params: HardwareParameters, fusion_params: FusionParameters, mapping: FineGrainedMapping) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         total_latency = torch.tensor(0.0)
         total_energy = torch.tensor(0.0)
+        
+        # 简化：假设整个网络共享一套mapping参数，实际可扩展为per-layer mapping
+        all_factors = mapping.get_all_factors()
+
         for group in graph.fusion_groups:
-            template = mapping_params.get_expert_template(group)
-            if template:
-                latency, energy = self._calculate_expert_template_performance(group, template, hardware_params, fusion_params)
-                total_latency += latency
-                total_energy += energy
-        return total_latency, total_energy, hardware_params.get_area_cost()
-    def _calculate_expert_template_performance(self, group: List[str], template: LearnableConvReluTemplate, hardware_params: HardwareParameters, fusion_params: FusionParameters) -> Tuple[torch.Tensor, torch.Tensor]:
-        p_fuse = fusion_params.get_fusion_probability(group)
-        costs = {}
-        for case in ['fused', 'non_fused']:
-            is_fused = (case == 'fused')
-            macs = calculate_macs(template.dims, 'Conv')
-            gops = hardware_params.get_num_pes() * (self.config.CLOCK_FREQUENCY_MHZ / 1000.0)
-            compute_latency = macs / (gops * 1e9)
-            access_counts = template.get_access_counts(is_fused)
-            total_bytes_to_dram = sum(access_counts.values()) * self.config.BYTES_PER_ELEMENT
-            memory_latency = total_bytes_to_dram / (self.config.DRAM_BANDWIDTH_GB_S * 1e9)
-            latency = torch.maximum(compute_latency, torch.tensor(memory_latency, dtype=torch.float32))
+            # 此处简化为对单个layer进行评估
+            layer_name = group[0]
+            layer = graph.layers[layer_name]
+            macs = calculate_macs(layer['dims'])
             
-            # --- 基于40nm工艺数据表的精确能耗计算 ---
+            # --- Latency ---
+            # Compute Latency
+            num_pes = hw_params.get_projected_num_pes()
+            compute_latency = macs / (num_pes * self.config.CLOCK_FREQUENCY_MHZ * 1e6 + 1e-9)
             
-            # 1. PE能耗: MAC运算
-            pe_energy = macs * self.config.PE_MAC_EPA_PJ
+            # Memory Latency
+            mem_latencies = []
+            for i, level in enumerate(self.config.MEMORY_HIERARCHY):
+                if level['type'] == 'dram':
+                    # 计算DRAM访问量和时延
+                    dram_accesses_bytes = self.calculate_accesses_bytes(layer['dims'], all_factors, i)
+                    mem_latencies.append(dram_accesses_bytes / (level['bandwidth_gb_s'] * 1e9 + 1e-9))
             
-            # 2. Register能耗: 基于访问次数
-            # 假设每个MAC需要访问2个寄存器 (输入和权重)
-            register_accesses = macs * 2
-            register_energy = register_accesses * self.config.REGISTER_EPA_PJ
-            
-            # 3. Accumulator能耗: 容量相关公式
-            # EPA = 1.94 + 0.1005 × (C₁ / √CPE) μJ
-            # 其中 C₁ 是总accumulator容量，CPE是每个PE的容量
-            total_accumulator_capacity_kb = hardware_params.get_num_pes() * self.config.ACCUMULATOR_CAPACITY_PER_PE_KB
-            cpe_kb = self.config.ACCUMULATOR_CAPACITY_PER_PE_KB
-            accumulator_epa_pj = self.config.ACCUMULATOR_BASE_EPA_PJ + \
-                                self.config.ACCUMULATOR_CAPACITY_COEFF_PJ * (total_accumulator_capacity_kb / torch.sqrt(torch.tensor(cpe_kb, dtype=torch.float32)))
-            # 假设每个MAC需要一次accumulator访问
-            accumulator_energy = macs * accumulator_epa_pj
-            
-            # 4. Scratchpad能耗: 容量相关公式
-            # EPA = 0.49 + 0.025 × C₂ μJ
-            # 其中 C₂ 是scratchpad容量 (KB)
-            scratchpad_capacity_kb = hardware_params.get_buffer_size_kb()
-            scratchpad_epa_pj = self.config.SCRATCHPAD_BASE_EPA_PJ + \
-                               self.config.SCRATCHPAD_CAPACITY_COEFF_PJ_PER_KB * scratchpad_capacity_kb
-            
-            # 计算scratchpad访问次数 (基于buffer requirements)
-            buffer_req_bytes = sum(template.get_buffer_requirements().values())
-            buffer_req_kb = buffer_req_bytes / 1024.0
-            # 假设每个tile需要一次scratchpad访问
-            scratchpad_accesses = buffer_req_kb / scratchpad_capacity_kb * macs  # 简化的访问模型
-            scratchpad_energy = scratchpad_accesses * scratchpad_epa_pj
-            
-            # 5. DRAM能耗: 基于访问次数
-            dram_accesses = total_bytes_to_dram / self.config.BYTES_PER_ELEMENT  # 按元素计算访问次数
-            dram_energy = dram_accesses * self.config.DRAM_EPA_PJ
-            
-            # 总能耗
-            energy = pe_energy + register_energy + accumulator_energy + scratchpad_energy + dram_energy
-            
-            penalty_multiplier = torch.relu(buffer_req_bytes / hardware_params.get_buffer_size_bytes() - 1.0) * self.config.PENALTY_WEIGHT + 1.0
-            costs[case] = {'latency': latency * penalty_multiplier, 'energy': energy * penalty_multiplier}
-        latency = p_fuse * costs['fused']['latency'] + (1 - p_fuse) * costs['non_fused']['latency']
-        energy = p_fuse * costs['fused']['energy'] + (1 - p_fuse) * costs['non_fused']['energy']
-        return latency, energy
+            latency = torch.maximum(compute_latency, sum(mem_latencies))
 
-# --- NEW: Configuration Saving and Comparison Table ---
+            # --- Energy ---
+            energy = torch.tensor(0.0)
+            # PE energy
+            energy += macs * self.config.PE_MAC_EPA_PJ
+            
+            # Memory energy
+            for i, level in enumerate(self.config.MEMORY_HIERARCHY):
+                accesses_bytes = self.calculate_accesses_bytes(layer['dims'], all_factors, i)
+                accesses_4bytes = accesses_bytes / 4.0 # 假设一个access是4-byte
+                
+                if level['name'] == 'L1_Registers':
+                    energy += accesses_4bytes * self.config.L1_REG_BASE_EPA_PJ
+                elif level['name'] == 'L2_Scratchpad':
+                    size_kb = hw_params.get_buffer_size_kb(level['name'])
+                    epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
+                    energy += accesses_4bytes * epa
+                elif level['name'] == 'L3_DRAM':
+                    energy += accesses_4bytes * self.config.L3_DRAM_EPA_PJ
 
-def save_configuration_to_file(method_name: str, results: Dict[str, Any]):
-    """Saves the detailed configuration of a method to a text file."""
-    filename = f"{method_name.replace(' ', '_').lower()}_config.txt"
-    with open(filename, 'w') as f:
-        f.write(f"--- Configuration Report for: {method_name} ---\n\n")
+            # --- Capacity Penalty ---
+            penalty = torch.tensor(0.0)
+            for i, level in enumerate(self.config.MEMORY_HIERARCHY):
+                 if level['type'] == 'buffer':
+                    required_kb = self.calculate_buffer_req_kb(layer['dims'], all_factors, i)
+                    available_kb = hw_params.get_buffer_size_kb(level['name'])
+                    penalty += torch.relu(required_kb / available_kb - 1.0)
+
+            total_latency += latency * (1 + penalty * self.config.PENALTY_WEIGHT)
+            total_energy += energy * (1 + penalty * self.config.PENALTY_WEIGHT)
+
+        return total_latency, total_energy, hw_params.get_area_cost()
+
+    def calculate_accesses_bytes(self, dims, factors, level_idx):
+        """简化版的访存计算，模拟从上一级存储读写。"""
+        # 访问量 = tile大小 * 外层循环次数
+        # tile大小在 level_idx-1 确定
+        if level_idx == 0: return torch.tensor(0.0) # PE内部无访存
         
-        # Performance Metrics
-        f.write("=== Performance Metrics ===\n")
-        f.write(f"  EDP (pJ*s): {results['EDP']:.4e}\n")
-        f.write(f"  Latency (s): {results['Latency']:.4e}\n")
-        f.write(f"  Energy (pJ): {results['Energy']:.4e}\n\n")
+        # Tile size at level_idx-1
+        tile_size_bytes = self.calculate_buffer_req_bytes(dims, factors, level_idx - 1)
 
-        # Hardware Configuration
-        f.write("=== Hardware Configuration ===\n")
-        hw_params = results['hardware_params']
-        f.write(f"  Processing Elements (PEs): {hw_params.get_num_pes().item():.0f}\n")
-        f.write(f"  On-chip Buffer (KB): {hw_params.get_buffer_size_kb().item():.2f}\n")
-        f.write(f"  Total Area (mm²): {hw_params.get_area_cost().item():.2f}\n\n")
+        # Outer loop iterations
+        outer_loops = torch.tensor(1.0)
+        for i in range(level_idx, len(self.config.MEMORY_HIERARCHY)):
+            level_name = self.config.MEMORY_HIERARCHY[i]['name']
+            if level_name in factors[next(iter(dims))]:
+                for dim_name in dims.keys():
+                    outer_loops = outer_loops * factors[dim_name][level_name]['temporal'].squeeze()
+        # 简化：假设input, weight, output traffic相同
+        return tile_size_bytes * outer_loops * 3
+
+    def calculate_buffer_req_bytes(self, dims, factors, level_idx):
+        """计算在level_idx需要的buffer大小，由其内部所有level的tiling决定。"""
+        # 简化：只计算input tensor的tile大小
+        tile_dims = {}
+        for dim_name in dims.keys():
+            tile_dims[dim_name] = torch.tensor(1.0)
+            for i in range(level_idx + 1):
+                level_name = self.config.MEMORY_HIERARCHY[i]['name']
+                if level_name in factors[dim_name]:
+                    tile_dims[dim_name] = tile_dims[dim_name] * factors[dim_name][level_name]['temporal'].squeeze() * factors[dim_name][level_name]['spatial'].squeeze()
         
-        # 40nm工艺能耗模型参数
-        f.write("=== 40nm工艺能耗模型参数 ===\n")
-        config = Config.get_instance()
-        f.write(f"  PE MAC EPA: {config.PE_MAC_EPA_PJ/1e6:.3f} μJ\n")
-        f.write(f"  Register EPA: {config.REGISTER_EPA_PJ/1e6:.3f} μJ\n")
-        f.write(f"  Accumulator Base EPA: {config.ACCUMULATOR_BASE_EPA_PJ/1e6:.3f} μJ\n")
-        f.write(f"  Accumulator Capacity Coeff: {config.ACCUMULATOR_CAPACITY_COEFF_PJ/1e6:.3f} μJ\n")
-        f.write(f"  Scratchpad Base EPA: {config.SCRATCHPAD_BASE_EPA_PJ/1e6:.3f} μJ\n")
-        f.write(f"  Scratchpad Capacity Coeff: {config.SCRATCHPAD_CAPACITY_COEFF_PJ_PER_KB/1e6:.3f} μJ/KB\n")
-        f.write(f"  DRAM EPA: {config.DRAM_EPA_PJ/1e6:.0f} μJ\n")
-        f.write(f"  Accumulator Capacity per PE: {config.ACCUMULATOR_CAPACITY_PER_PE_KB:.1f} KB\n")
-        f.write(f"  Register Capacity per PE: {config.REGISTER_CAPACITY_PER_PE_KB:.1f} KB\n\n")
-
-        # Fusion Decisions
-        f.write("=== Fusion Decisions (p_fuse > 0.5) ===\n")
-        fusion_params = results['fusion_params']
-        for group in results['graph'].fusion_groups:
-            prob = fusion_params.get_fusion_probability(group).item()
-            if prob > 0.5:
-                f.write(f"  - FUSED: {' -> '.join(group)} (Prob: {prob:.4f})\n")
-        f.write("\n")
-
-        # Mapping Parameters (Tiling Factors)
-        f.write("=== Mapping Tiling Factors (from Learnable Expert Templates) ===\n")
-        mapping_params = results['mapping_params']
-        for group, template in mapping_params.expert_templates.items():
-            f.write(f"  Group: {' -> '.join(group)}\n")
-            f.write(f"    - M0 (Feature Map Tile): {template.get_M0().item():.2f}\n")
-            f.write(f"    - K0 (Input Channel Tile): {template.get_K0().item():.2f}\n")
-            f.write(f"    - N0 (Output Channel Tile): {template.get_N0().item():.2f}\n")
-            
-    print(f"Configuration for {method_name} saved to {filename}")
-
-def generate_comparison_table(result1: Dict[str, Any], result2: Dict[str, Any]):
-    """Prints a markdown table comparing the configurations of two methods."""
-    hw1, hw2 = result1['hardware_params'], result2['hardware_params']
+        return reduce(mul, tile_dims.values(), torch.tensor(1.0)) * self.config.BYTES_PER_ELEMENT
     
-    table = "| Parameter | {r1_name} | {r2_name} |\n".format(r1_name=result1['Method'], r2_name=result2['Method'])
-    table += "|:---|:---:|:---:|\n"
-    table += f"| **EDP (pJ*s)** | {result1['EDP']:.3e} | {result2['EDP']:.3e} |\n"
-    table += f"| **Latency (s)** | {result1['Latency']:.3e} | {result2['Latency']:.3e} |\n"
-    table += f"| **Energy (pJ)** | {result1['Energy']:.3e} | {result2['Energy']:.3e} |\n"
-    table += "|---|---|---|\n"
-    table += f"| **Area (mm²)** | {hw1.get_area_cost().item():.2f} | {hw2.get_area_cost().item():.2f} |\n"
-    table += f"| **PEs** | {hw1.get_num_pes().item():.0f} | {hw2.get_num_pes().item():.0f} |\n"
-    table += f"| **Buffer (KB)** | {hw1.get_buffer_size_kb().item():.2f} | {hw2.get_buffer_size_kb().item():.2f} |\n"
+    def calculate_buffer_req_kb(self, dims, factors, level_idx):
+        return self.calculate_buffer_req_bytes(dims, factors, level_idx) / 1024.0
+
+def save_configuration_to_json(hw_params: HardwareParameters, 
+                              projected_mapping: dict, 
+                              fusion_params: FusionParameters, 
+                              filepath: str = "final_configuration.json"):
+    """
+    Save the final optimized configuration to a structured JSON file.
     
-    print("\n\n" + "="*60)
-    print("                 CONFIGURATION COMPARISON")
-    print("="*60)
-    print(table)
+    Args:
+        hw_params: Hardware parameters object
+        projected_mapping: The final projected mapping table
+        fusion_params: Fusion parameters object
+        filepath: Output JSON file path
+    """
+    config_dict = {
+        "hardware": {},
+        "mapping": {},
+        "fusion": {}
+    }
+    
+    # Populate hardware section
+    config_dict["hardware"]["num_pes"] = int(hw_params.get_projected_num_pes().item())
+    config_dict["hardware"]["buffer_sizes_kb"] = {}
+    
+    for buffer_name, log_size in hw_params.log_buffer_sizes_kb.items():
+        config_dict["hardware"]["buffer_sizes_kb"][buffer_name] = float(torch.exp(log_size).item())
+    
+    # Populate mapping section
+    config_dict["mapping"] = projected_mapping
+    
+    # Populate fusion section
+    for group_key, logit_param in fusion_params.fusion_probs.items():
+        fusion_prob = torch.sigmoid(logit_param).item()
+        config_dict["fusion"][group_key] = float(fusion_prob)
+    
+    # Write to JSON file
+    with open(filepath, 'w') as f:
+        json.dump(config_dict, f, indent=4)
+    
+    print(f"Configuration saved to {filepath}")
 
-# --- Experiment Functions (Modified to return all params) ---
+# --- 主实验流程 ---
+def run_experiment(num_iterations=100):
+    print("--- Running High-Fidelity FA-DOSA Experiment ---")
+    config = Config()
+    graph = parse_onnx_to_graph("resnet.onnx")
 
-def run_expert_fa_dosa_experiment(graph: ComputationGraph, config: Config, num_iterations=200) -> dict:
-    print("\nRunning Fusion-aware DOSA (Learnable Expert Template) experiment...")
-    hardware_params = HardwareParameters(initial_num_pes=64, initial_buffer_kb=128)
+    hw_params = HardwareParameters()
+    # 使用一个共享的mapping对象
+    mapping = FineGrainedMapping(graph.problem_dims, config.MEMORY_HIERARCHY)
     fusion_params = FusionParameters(graph)
-    mapping_params = MappingParameters(graph)
-    perf_model = RealisticPerformanceModel(config)
+    perf_model = HighFidelityPerformanceModel(config)
     
-    all_params = list(hardware_params.parameters()) + list(fusion_params.parameters()) + list(mapping_params.parameters())
+    all_params = list(hw_params.parameters()) + list(mapping.parameters()) + list(fusion_params.parameters())
     optimizer = optim.Adam(all_params, lr=1e-2)
 
     for i in range(num_iterations):
         optimizer.zero_grad()
-        latency, energy, area = perf_model(graph, hardware_params, fusion_params, mapping_params)
-        loss = torch.log(latency + 1e-12) + torch.log(energy + 1e-12) + 0.01 * area
+        latency, energy, area = perf_model(graph, hw_params, fusion_params, mapping)
+        
+        # NEW: Add PE square penalty
+        continuous_pes = hw_params.get_num_pes()
+        sqrt_pes = torch.sqrt(continuous_pes)
+        pe_square_penalty = torch.pow(sqrt_pes - torch.round(sqrt_pes), 2)
+        pe_penalty_weight = 1.0
+
+        # Combine all loss terms
+        edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+        area_loss = 0.1 * area
+        
+        loss = edp_loss + area_loss + pe_square_penalty * pe_penalty_weight
         loss.backward()
         optimizer.step()
-        if i % 20 == 0:
-            print(f"[FA-DOSA] Iter {i}: Loss={loss.item():.4f}, Latency={latency.item():.2e}s, Energy={energy.item():.2e}pJ, Area={area.item():.2f}mm²")
+        
+        if i % 10 == 0:
+            print(f"Iter {i}: Loss={loss.item():.4f}, EDP={edp_loss.item():.4f}, Area={area_loss.item():.4f}, PE_Penalty={pe_square_penalty.item():.4f}")
+            print(f"         Latency={latency.item():.2e}s, Energy={energy.item():.2e}pJ, Area={area.item():.2f}mm²")
+    
+    print("\n--- Final Configuration ---")
+    print(f"PEs: {hw_params.get_projected_num_pes().item():.0f}")
+    for level in config.MEMORY_HIERARCHY:
+        if level['type'] == 'buffer':
+            print(f"{level['name']} Size: {hw_params.get_buffer_size_kb(level['name']).item():.2f} KB")
 
-    with torch.no_grad():
-        for param in fusion_params.parameters():
-            param.data = (param.data > 0).float() * 10.0 - (param.data <= 0).float() * 10.0
-        final_latency, final_energy, final_area = perf_model(graph, hardware_params, fusion_params, mapping_params)
-    
-    return {
-        'Method': 'Fusion-aware DOSA',
-        'EDP': final_latency.item() * final_energy.item(),
-        'Latency': final_latency.item(),
-        'Energy': final_energy.item(),
-        'Area': final_area.item(),
-        'hardware_params': hardware_params,
-        'fusion_params': fusion_params,
-        'mapping_params': mapping_params,
-        'graph': graph
-    }
+    # Get the final projected mapping
+    final_mapping = mapping.get_all_factors()
 
-def run_decoupled_sota_experiment(graph: ComputationGraph, config: Config) -> dict:
-    print("\nRunning Decoupled SOTA baseline experiment...")
-    buffer_sizes_kb = [64, 128, 256, 512]
-    pe_counts = [32, 64, 128, 256]
-    best_edp_nf = float('inf')
-    best_hw_params, best_mapping_params = None, None
-    perf_model = RealisticPerformanceModel(config)
-    
-    print("  Step 1: Hardware DSE (optimizing mapping for each fixed HW)...")
-    for buf_kb in buffer_sizes_kb:
-        for pes in pe_counts:
-            hw_params = HardwareParameters(initial_num_pes=pes, initial_buffer_kb=buf_kb)
-            mapping_params = MappingParameters(graph)
-            fusion_params_nf = FusionParameters(graph)
-            with torch.no_grad():
-                for param in fusion_params_nf.parameters(): param.fill_(-10.0)
-            
-            # Short optimization for mapping on fixed hardware
-            optimizer = optim.Adam(mapping_params.parameters(), lr=1e-2)
-            for _ in range(50):
-                optimizer.zero_grad()
-                latency, energy, _ = perf_model(graph, hw_params, fusion_params_nf, mapping_params)
-                loss = torch.log(latency + 1e-12) + torch.log(energy + 1e-12)
-                loss.backward()
-                optimizer.step()
+    # Convert tensors to floats for JSON serialization
+    for dim_name, dim_factors in final_mapping.items():
+        for level_name, level_factors in dim_factors.items():
+            final_mapping[dim_name][level_name]['temporal'] = level_factors['temporal'].item()
+            final_mapping[dim_name][level_name]['spatial'] = level_factors['spatial'].item()
 
-            with torch.no_grad():
-                latency, energy, _ = perf_model(graph, hw_params, fusion_params_nf, mapping_params)
-            edp = latency.item() * energy.item()
-            
-            if edp < best_edp_nf:
-                best_edp_nf = edp
-                best_hw_params = hw_params
-                best_mapping_params = mapping_params
-
-    print(f"  Best non-fused HW found: {best_hw_params.get_num_pes().item():.0f} PEs, {best_hw_params.get_buffer_size_kb().item():.0f} KB Buffer")
-    
-    print("  Step 2: Applying fusion heuristics on best hardware...")
-    final_fusion_params = FusionParameters(graph)
-    with torch.no_grad():
-        for group in graph.fusion_groups:
-            p_fused = FusionParameters(graph); p_fused.get_fusion_probability(group).data.fill_(10.0)
-            p_nf = FusionParameters(graph); p_nf.get_fusion_probability(group).data.fill_(-10.0)
-            lat_f, en_f, _ = perf_model(graph, best_hw_params, p_fused, best_mapping_params)
-            lat_nf, en_nf, _ = perf_model(graph, best_hw_params, p_nf, best_mapping_params)
-            if (lat_f * en_f) < (lat_nf * en_nf):
-                final_fusion_params.get_fusion_probability(group).data.fill_(10.0)
-            else:
-                final_fusion_params.get_fusion_probability(group).data.fill_(-10.0)
-
-    final_latency, final_energy, final_area = perf_model(graph, best_hw_params, final_fusion_params, best_mapping_params)
-    
-    return {
-        'Method': 'Decoupled SOTA',
-        'EDP': final_latency.item() * final_energy.item(),
-        'Latency': final_latency.item(),
-        'Energy': final_energy.item(),
-        'Area': final_area.item(),
-        'hardware_params': best_hw_params,
-        'fusion_params': final_fusion_params,
-        'mapping_params': best_mapping_params,
-        'graph': graph
-    }
-
-# --- Main Execution Block ---
-def main():
-    config = Config.get_instance()
-    print("Parsing ResNet-18 ONNX model...")
-    graph = parse_onnx_to_graph("resnet18.onnx")
-    print(f"Loaded graph with {len(graph.fusion_groups)} potential fusion groups.")
-    
-    # Run experiments
-    expert_results = run_expert_fa_dosa_experiment(graph, config, num_iterations=200)
-    sota_results = run_decoupled_sota_experiment(graph, config)
-    
-    # Save detailed configurations to files
-    save_configuration_to_file("Expert_FA-DOSA", expert_results)
-    save_configuration_to_file("Decoupled_SOTA", sota_results)
-
-    # Print comparative summary table
-    generate_comparison_table(expert_results, sota_results)
-    
-    # Visualization
-    labels = [expert_results['Method'], sota_results['Method']]
-    edps = [expert_results['EDP'], sota_results['EDP']]
-    areas = [expert_results['Area'], sota_results['Area']]
-    
-    fig, ax1 = plt.subplots(figsize=(10, 6))
-    color = 'tab:blue'
-    ax1.set_xlabel('Methodology')
-    ax1.set_ylabel('EDP (pJ*s, log scale)', color=color)
-    ax1.bar([labels[0][:15]+"...", labels[1]], edps, color=color, alpha=0.6, width=0.4)
-    ax1.tick_params(axis='y', labelcolor=color)
-    ax1.set_yscale('log')
-    ax2 = ax1.twinx()
-    color = 'tab:red'
-    ax2.set_ylabel('Area (mm²)', color=color)
-    ax2.plot([labels[0][:15]+"...", labels[1]], areas, color=color, marker='o', linestyle='--')
-    ax2.tick_params(axis='y', labelcolor=color)
-    fig.tight_layout()
-    plt.title('FA-DOSA (Learnable Expert Template) vs. Decoupled SOTA')
-    plt.grid(True, which="both", ls="--", alpha=0.5)
-    plt.show()
+    # Save the final configuration to JSON
+    save_configuration_to_json(hw_params, final_mapping, fusion_params, "final_configuration.json")
 
 if __name__ == "__main__":
-    main()
+    run_experiment(num_iterations=100)

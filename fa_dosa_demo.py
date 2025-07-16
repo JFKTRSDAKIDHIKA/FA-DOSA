@@ -1398,6 +1398,120 @@ class ComputationGraph:
                         f"Fusion group layers '{group[i]}' and '{group[i + 1]}' "
                         "must be connected by an edge"
                     )
+                    
+    def identify_and_register_fusion_groups(self) -> None:
+        """
+        Automatically identify potential fusion patterns from the graph structure.
+        This method scans the graph's layers and edges to find predefined, valid fusion patterns.
+        It should be called after the graph is parsed.
+        
+        Target patterns to match:
+        1. Conv → BatchNorm → ReLU
+        2. Conv → ReLU
+        3. MatMul/Gemm → Add
+        4. MatMul/Gemm → GELU
+        5. LayerNorm → MatMul/Gemm
+        
+        Note: A single, non-fusable layer is also treated as a "group" of size one for consistent processing.
+        """
+        # Clear existing fusion groups to avoid duplicates
+        self.fusion_groups = []
+        fusion_count = 0
+        node_dict = {}
+        
+        # Create a dictionary for quick lookup of node types
+        for name, info in self.layers.items():
+            node_dict[name] = {'type': info['type']}
+        
+        # Track which layers have been added to fusion groups
+        layers_in_fusion_groups = set()
+        
+        # Pattern 1: Conv → BatchNorm → ReLU
+        for src, dst in self.edges:
+            if (src in node_dict and dst in node_dict and
+                node_dict[src]['type'] == 'Conv' and
+                node_dict[dst]['type'] == 'BatchNorm'):
+                
+                # Check if there's a ReLU after BatchNorm
+                bn_consumers = self.get_node_consumers(dst)
+                for relu_candidate in bn_consumers:
+                    if (relu_candidate in node_dict and 
+                        node_dict[relu_candidate]['type'] == 'ReLU' and
+                        len(bn_consumers) == 1):  # Ensure linear chain
+                        
+                        fusion_group = [src, dst, relu_candidate]
+                        self.add_fusion_group(fusion_group)
+                        layers_in_fusion_groups.update(fusion_group)
+                        fusion_count += 1
+                        break
+        
+        # Pattern 2: Conv → ReLU
+        for src, dst in self.edges:
+            # Skip if Conv is already part of a Conv->BatchNorm->ReLU group
+            if src in layers_in_fusion_groups:
+                continue
+                
+            if (src in node_dict and dst in node_dict and
+                node_dict[src]['type'] == 'Conv' and
+                node_dict[dst]['type'] == 'ReLU'):
+                
+                fusion_group = [src, dst]
+                self.add_fusion_group(fusion_group)
+                layers_in_fusion_groups.update(fusion_group)
+                fusion_count += 1
+        
+        # Pattern 3: MatMul/Gemm → Add
+        for src, dst in self.edges:
+            # Skip if already in a fusion group
+            if src in layers_in_fusion_groups:
+                continue
+                
+            if (src in node_dict and dst in node_dict and
+                node_dict[src]['type'] in ['MatMul', 'Gemm'] and
+                node_dict[dst]['type'] == 'Add'):
+                
+                fusion_group = [src, dst]
+                self.add_fusion_group(fusion_group)
+                layers_in_fusion_groups.update(fusion_group)
+                fusion_count += 1
+        
+        # Pattern 4: MatMul/Gemm → GELU
+        for src, dst in self.edges:
+            # Skip if already in a fusion group
+            if src in layers_in_fusion_groups:
+                continue
+                
+            if (src in node_dict and dst in node_dict and
+                node_dict[src]['type'] in ['MatMul', 'Gemm'] and
+                node_dict[dst]['type'] in ['GELU', 'Gelu']):
+                
+                fusion_group = [src, dst]
+                self.add_fusion_group(fusion_group)
+                layers_in_fusion_groups.update(fusion_group)
+                fusion_count += 1
+        
+        # Pattern 5: LayerNorm → MatMul/Gemm
+        for src, dst in self.edges:
+            # Skip if already in a fusion group
+            if src in layers_in_fusion_groups:
+                continue
+                
+            if (src in node_dict and dst in node_dict and
+                node_dict[src]['type'] == 'LayerNorm' and
+                node_dict[dst]['type'] in ['MatMul', 'Gemm']):
+                
+                fusion_group = [src, dst]
+                self.add_fusion_group(fusion_group)
+                layers_in_fusion_groups.update(fusion_group)
+                fusion_count += 1
+        
+        # Add remaining single layers as "groups" of size one
+        for layer_name in self.layers.keys():
+            if layer_name not in layers_in_fusion_groups:
+                self.add_fusion_group([layer_name])
+        
+        print(f"Identified and registered {fusion_count} fusion groups and {len(self.layers) - len(layers_in_fusion_groups)} single-layer groups.")
+        self.validate()
 
 class MappingParameters(nn.Module):
     """
@@ -2490,7 +2604,7 @@ class ConditionalPerformanceModel(nn.Module):
                         position = 'head'  # 链头
                     elif i == len(group_layers) - 1:
                         position = 'tail'  # 链尾
-            else:
+                    else:
                         position = 'middle'  # 链中
                     
                     # 获取该层对应的决策模块
@@ -2557,13 +2671,13 @@ class ConditionalPerformanceModel(nn.Module):
                 final_group_latency = p_fuse * fused_latency + (1 - p_fuse) * non_fused_latency
                 final_group_energy = p_fuse * fused_energy + (1 - p_fuse) * non_fused_energy
         else:
-                # 独立层，直接使用计算出的成本
-                final_group_latency = group_latency
-                final_group_energy = group_energy
+            # 独立层，直接使用计算出的成本
+            final_group_latency = group_latency
+            final_group_energy = group_energy
             
-            # === 累加到总成本 ===
-            total_latency = total_latency + final_group_latency
-            total_energy = total_energy + final_group_energy
+        # === 累加到总成本 ===
+        total_latency = total_latency + final_group_latency
+        total_energy = total_energy + final_group_energy
         
         # === 数值稳定性检查 ===
         min_value = 1e-6
@@ -2753,4 +2867,4 @@ if __name__ == "__main__":
     #         print(f"Epoch {epoch}: Loss = {loss.item():.4f}")
     #         print(f"Hardware Config: {hardware_params}")
     
-    pass 
+    pass
