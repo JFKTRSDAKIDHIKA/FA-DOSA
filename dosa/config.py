@@ -37,7 +37,8 @@ class Config:
         self.AREA_PER_KB_L1_MM2 = 0.008 # L1通常更贵
         self.AREA_PER_KB_L2_MM2 = 0.005 # L2相对便宜
         self.AREA_BASE_MM2 = 1.0
-        self.PENALTY_WEIGHT = 1e6
+        self.PENALTY_WEIGHT = 1
+        self.MISMATCH_PENALTY_WEIGHT = 1.0
 
     @staticmethod
     def get_instance():

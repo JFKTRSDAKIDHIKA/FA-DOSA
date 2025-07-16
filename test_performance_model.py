@@ -41,17 +41,24 @@ class TestPerformanceModel(unittest.TestCase):
             # B. Calculate Num_Reloads from L3
             num_reloads = torch.tensor(1.0)
             if tensor_type == 'Input':
-                reuse_dims = ['K']
+                reload_dims = ['N', 'P', 'Q']  # Input is reloaded when iterating over these dimensions
             elif tensor_type == 'Weight':
-                reuse_dims = ['N', 'P', 'Q']
+                reload_dims = ['K']  # Weight is reloaded when iterating over K
             elif tensor_type == 'Output':
-                reuse_dims = ['C', 'R', 'S']
+                reload_dims = ['N', 'K', 'P', 'Q']  # Output is produced for each of these dimensions
             else:
-                reuse_dims = []
+                reload_dims = []
             
-            for dim_name in reuse_dims:
+            for dim_name in reload_dims:
                 if dim_name in layer_dims:
-                    num_reloads *= mapping_table[dim_name]['L3_DRAM']['temporal']
+                    # Calculate total tiled size at L2 for this dimension
+                    dim_tile_size_at_L2 = (mapping_table[dim_name]['L1_Registers']['temporal'] * 
+                                          mapping_table[dim_name]['L1_Registers']['spatial'] *
+                                          mapping_table[dim_name]['L2_Scratchpad']['temporal'] * 
+                                          mapping_table[dim_name]['L2_Scratchpad']['spatial'])
+                    # Number of reloads for this dimension
+                    num_reloads_for_dim = torch.ceil(torch.tensor(float(layer_dims[dim_name])) / dim_tile_size_at_L2)
+                    num_reloads *= num_reloads_for_dim
 
             tensor_access_elements = tile_size_at_L2 * num_reloads
             total_expected_access_bytes += tensor_access_elements * self.config.BYTES_PER_ELEMENT

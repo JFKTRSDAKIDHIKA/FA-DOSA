@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import json
 from typing import Dict, List, Tuple
 
 # Memoization cache for divisors
@@ -57,6 +58,39 @@ def save_configuration_to_json(hw_params, projected_mapping, file_path="final_co
         "l2_size_kb": hw_params.get_buffer_size_kb('L2_Scratchpad').item(),
         "mapping": projected_mapping
     }
-    import json
     with open(file_path, 'w') as f:
         json.dump(config_dict, f, indent=4)
+
+
+class OptimizationLogger:
+    """A simple logger to save optimization snapshots to a JSON Lines file."""
+
+    def __init__(self, log_path="optimization_log.jsonl"):
+        """Initializes the logger and opens the log file for writing."""
+        self.log_path = log_path
+        # Open the file in 'w' mode to clear previous logs on a new run
+        self.log_file = open(self.log_path, 'w')
+
+    def log_step(self, step_info: dict):
+        """
+        Logs a single dictionary of information as a JSON string on a new line.
+        Converts PyTorch tensors to basic Python types for serialization.
+        """
+        # A helper function to recursively convert tensors to numbers
+        def to_native_types(data):
+            if isinstance(data, dict):
+                return {k: to_native_types(v) for k, v in data.items()}
+            if isinstance(data, list):
+                return [to_native_types(i) for i in data]
+            if isinstance(data, torch.Tensor):
+                return data.item()
+            return data
+
+        serializable_info = to_native_types(step_info)
+        self.log_file.write(json.dumps(serializable_info) + '\n')
+        # Flush the buffer to ensure data is written immediately
+        self.log_file.flush()
+
+    def close(self):
+        """Closes the log file."""
+        self.log_file.close()
