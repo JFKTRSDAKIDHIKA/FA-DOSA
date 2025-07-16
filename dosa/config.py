@@ -5,6 +5,7 @@ class Config:
     """全局配置类，已更新为支持多级存储层次结构。"""
     _instance = None
     def __init__(self):
+        self.DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.BYTES_PER_ELEMENT = 4
         self.CLOCK_FREQUENCY_MHZ = 1000
         self.L1_REG_BANDWIDTH_GB_S = 1024

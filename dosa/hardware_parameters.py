@@ -25,14 +25,16 @@ class HardwareParameters(nn.Module):
     def get_buffer_size_kb(self, level_name: str):
         return torch.exp(self.log_buffer_sizes_kb[level_name])
         
-    def get_area_cost(self, performance_model, all_factors, layer_dims):
+    def get_area_cost(self) -> torch.Tensor:
+        """Calculate total hardware area based on provisioned parameters.
+        
+        Returns:
+            torch.Tensor: Total hardware area in mm²
+        """
         config = Config.get_instance()
         pe_area = self.get_projected_num_pes() * config.AREA_PER_PE_MM2
         
-        l1_buffer_req_kb = performance_model.calculate_buffer_req_kb(layer_dims, all_factors, 0)
-        l2_buffer_req_kb = performance_model.calculate_buffer_req_kb(layer_dims, all_factors, 1)
-
-        l1_buffer_area = l1_buffer_req_kb * config.AREA_PER_KB_L1_MM2
-        l2_buffer_area = l2_buffer_req_kb * config.AREA_PER_KB_L2_MM2
+        l1_buffer_area = self.get_buffer_size_kb('L1_Registers') * config.AREA_PER_KB_L1_MM2
+        l2_buffer_area = self.get_buffer_size_kb('L2_Scratchpad') * config.AREA_PER_KB_L2_MM2
         
         return config.AREA_BASE_MM2 + pe_area + l1_buffer_area + l2_buffer_area

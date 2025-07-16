@@ -23,25 +23,38 @@ class HighFidelityPerformanceModel(nn.Module):
         super().__init__()
         self.config = config
 
-    def calculate_per_level_accesses(self, layer_dims, mapping_table) -> dict:
+    def calculate_per_level_accesses(self, layer_dims: dict, mapping_table: dict) -> dict:
         """
-        Calculate data movement between adjacent memory levels.
+        Refactored method to calculate data movement between adjacent memory levels based on a physically accurate model.
+        Accesses = Tile_Size_at_Lower_Level * Num_Reloads
         """
         accesses = {}
-        memory_levels = [level['name'] for level in self.config.MEMORY_HIERARCHY if level['type'] == 'buffer' or level['type'] == 'dram']
+        memory_levels = [level for level in self.config.MEMORY_HIERARCHY if level['type'] in ['buffer', 'dram']]
+        level_names = [level['name'] for level in memory_levels]
 
+        # Iterate through interfaces from outside-in
         for i in range(len(memory_levels) - 1):
-            upper_level = memory_levels[i+1]
-            lower_level = memory_levels[i]
-            interface_name = f"{upper_level}_to_{lower_level}"
-            total_access_bytes = torch.tensor(0.0)
+            upper_level_idx = i + 1
+            lower_level_idx = i
+            upper_level_name = level_names[upper_level_idx]
+            lower_level_name = level_names[lower_level_idx]
+            interface_name = f"{upper_level_name}_to_{lower_level_name}"
+            total_access_bytes_for_interface = torch.tensor(0.0, device=self.config.DEVICE)
 
-            for tensor_type, dims in TENSOR_DIM_MAP.items():
-                # Calculate the full tensor size in elements
-                tensor_size_elements = torch.tensor(1.0)
-                for dim in dims:
-                    tensor_size_elements *= layer_dims.get(dim, 1.0)
+            for tensor_type, relevant_dims in TENSOR_DIM_MAP.items():
+                # A. Calculate Tile_Size_at_Lower_Level
+                tile_size_at_lower_level = torch.tensor(1.0, device=self.config.DEVICE)
+                for dim_name in relevant_dims:
+                    if dim_name in layer_dims:
+                        # Product of all tiling factors up to and including the lower_level
+                        for level_idx in range(lower_level_idx + 1):
+                            level_name = level_names[level_idx]
+                            if dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                                tile_size_at_lower_level *= mapping_table[dim_name][level_name]['temporal']
+                                tile_size_at_lower_level *= mapping_table[dim_name][level_name]['spatial']
 
+                # B. Calculate Num_Reloads
+                num_reloads = torch.tensor(1.0, device=self.config.DEVICE)
                 # Define reuse dimensions for each tensor type
                 if tensor_type == 'Input':
                     reuse_dims = ['K']
@@ -52,27 +65,26 @@ class HighFidelityPerformanceModel(nn.Module):
                 else:
                     reuse_dims = []
 
-                # Calculate the reuse factor from temporal tiling
-                reuse_factor = torch.tensor(1.0)
-                for dim in reuse_dims:
-                    # The number of times a tile at level 'i' is reloaded from 'i+1' is determined by the temporal
-                    # loops executing at levels 'i+1' and higher.
-                    for level_idx in range(i + 1, len(memory_levels)):
-                        level_name = memory_levels[level_idx]
-                        if dim in mapping_table and level_name in mapping_table[dim]:
-                            reuse_factor *= mapping_table[dim][level_name]['temporal']
-                
-                # Accesses = Full Tensor Size / Reuse
-                tensor_access_elements = tensor_size_elements / reuse_factor
-                total_access_bytes += tensor_access_elements * self.config.BYTES_PER_ELEMENT
+                for dim_name in reuse_dims:
+                    if dim_name in layer_dims:
+                        # Product of temporal tiling factors at the upper_level and all levels outside of it
+                        for level_idx in range(upper_level_idx, len(memory_levels)):
+                            level_name = level_names[level_idx]
+                            if dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                                num_reloads *= mapping_table[dim_name][level_name]['temporal']
 
-            accesses[interface_name] = total_access_bytes
+                # C. Calculate Tensor_Accesses and Accumulate
+                tensor_access_elements = tile_size_at_lower_level * num_reloads
+                tensor_access_bytes = tensor_access_elements * self.config.BYTES_PER_ELEMENT
+                total_access_bytes_for_interface += tensor_access_bytes
+
+            accesses[interface_name] = total_access_bytes_for_interface
 
         return accesses
 
     def forward(self, graph, hw_params: HardwareParameters, fusion_params, mapping: FineGrainedMapping) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        total_latency = torch.tensor(0.0)
-        total_energy = torch.tensor(0.0)
+        total_latency = torch.tensor(0.0, device=self.config.DEVICE)
+        total_energy = torch.tensor(0.0, device=self.config.DEVICE)
         
         all_factors = mapping.get_all_factors()
 
@@ -96,7 +108,7 @@ class HighFidelityPerformanceModel(nn.Module):
             else:
                 latency = compute_latency
 
-            energy = torch.tensor(0.0)
+            energy = torch.tensor(0.0, device=self.config.DEVICE)
             energy += macs * self.config.PE_MAC_EPA_PJ
             
             for interface, accesses_bytes in per_level_accesses.items():
@@ -112,7 +124,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 elif lower_level_name == 'L3_DRAM':
                     energy += accesses_4bytes * self.config.L3_DRAM_EPA_PJ
 
-            penalty = torch.tensor(0.0)
+            penalty = torch.tensor(0.0, device=self.config.DEVICE)
             for i, level in enumerate(self.config.MEMORY_HIERARCHY):
                  if level['type'] == 'buffer':
                     required_kb = self.calculate_buffer_req_kb(layer['dims'], all_factors, i)
@@ -122,7 +134,7 @@ class HighFidelityPerformanceModel(nn.Module):
             total_latency += latency * (1 + penalty * self.config.PENALTY_WEIGHT)
             total_energy += energy * (1 + penalty * self.config.PENALTY_WEIGHT)
 
-        return total_latency, total_energy, hw_params.get_area_cost(self, all_factors, layer['dims'])
+        return total_latency, total_energy, hw_params.get_area_cost()
 
     def calculate_buffer_req_kb(self, dims, factors, level_idx):
         total_buffer_bytes = torch.tensor(0.0)

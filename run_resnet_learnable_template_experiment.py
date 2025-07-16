@@ -105,4 +105,4 @@ def run_experiment(num_iterations=1000):
     save_configuration_to_json(hw_params, final_mapping, "final_configuration.json")
 
 if __name__ == "__main__":
-    run_experiment(num_iterations=1000)
+    run_experiment(num_iterations=500)

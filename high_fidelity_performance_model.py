@@ -7,6 +7,13 @@ from operator import mul
 from fa_dosa_demo import ComputationGraph, FusionParameters, HardwareParameters
 from mapping_template import LearnableConvReluTemplate
 
+# Define TENSOR_DIM_MAP for data reuse modeling
+TENSOR_DIM_MAP = {
+    'Input':  ['N', 'C', 'P', 'Q', 'R', 'S'],
+    'Weight': ['K', 'C', 'R', 'S'],
+    'Output': ['N', 'K', 'P', 'Q']
+}
+
 
 def calculate_macs(dims: Dict[str, int], op_type: str) -> torch.Tensor:
     """
@@ -81,6 +88,78 @@ class HighFidelityPerformanceModel(nn.Module):
                     # Initialize learnable template
                     template = LearnableConvReluTemplate(problem_dims, self.config)
                     self.templates[group_key] = template
+    
+    def calculate_per_level_accesses(self, layer_dims: Dict[str, int], mapping_table: Dict) -> Dict[str, torch.Tensor]:
+        """
+        Refactored method to calculate data movement between adjacent memory levels based on a physically accurate model.
+        Accesses = Tile_Size_at_Lower_Level * Num_Reloads
+        
+        Args:
+            layer_dims: Dictionary of layer dimensions
+            mapping_table: Dictionary containing mapping factors for each dimension and level
+            
+        Returns:
+            Dictionary mapping interface names to their total access costs in bytes
+        """
+        accesses = {}
+        
+        # Get memory levels (excluding compute level)
+        memory_levels = [level for level in self.config.MEMORY_HIERARCHY if level['type'] in ['buffer', 'dram']]
+        level_names = [level['name'] for level in memory_levels]
+        
+        # Iterate through interfaces from outside-in (DRAM -> L2 -> L1)
+        for i in range(len(memory_levels) - 1):
+            upper_level_idx = i + 1  # Outer level (e.g., DRAM)
+            lower_level_idx = i      # Inner level (e.g., L2)
+            upper_level_name = level_names[upper_level_idx]
+            lower_level_name = level_names[lower_level_idx]
+            interface_name = f"{upper_level_name}_to_{lower_level_name}"
+            
+            total_access_bytes_for_interface = torch.tensor(0.0, device=self.config.DEVICE)
+            
+            # Calculate access for each tensor type
+            for tensor_type, relevant_dims in TENSOR_DIM_MAP.items():
+                # A. Calculate Tile_Size_at_Lower_Level
+                tile_size_at_lower_level = torch.tensor(1.0, device=self.config.DEVICE)
+                
+                for dim_name in relevant_dims:
+                    if dim_name in layer_dims:
+                        # Product of all tiling factors (temporal & spatial) up to and including the lower_level
+                        for level_idx in range(lower_level_idx + 1):
+                            level_name = level_names[level_idx]
+                            if dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                                tile_size_at_lower_level *= mapping_table[dim_name][level_name]['temporal']
+                                tile_size_at_lower_level *= mapping_table[dim_name][level_name]['spatial']
+                
+                # B. Calculate Num_Reloads
+                num_reloads = torch.tensor(1.0, device=self.config.DEVICE)
+                
+                # Define reuse dimensions for each tensor type based on data reuse patterns
+                if tensor_type == 'Input':
+                    reuse_dims = ['K']  # Input is reused across output channels
+                elif tensor_type == 'Weight':
+                    reuse_dims = ['N', 'P', 'Q']  # Weights are reused across batch and spatial dimensions
+                elif tensor_type == 'Output':
+                    reuse_dims = ['C', 'R', 'S']  # Output is reused across input channels and filter dimensions
+                else:
+                    reuse_dims = []
+                
+                for dim_name in reuse_dims:
+                    if dim_name in layer_dims:
+                        # Product of temporal tiling factors at the upper_level and all levels outside of it
+                        for level_idx in range(upper_level_idx, len(memory_levels)):
+                            level_name = level_names[level_idx]
+                            if dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                                num_reloads *= mapping_table[dim_name][level_name]['temporal']
+                
+                # C. Calculate Tensor_Accesses and Accumulate
+                tensor_access_elements = tile_size_at_lower_level * num_reloads
+                tensor_access_bytes = tensor_access_elements * self.config.BYTES_PER_ELEMENT
+                total_access_bytes_for_interface += tensor_access_bytes
+            
+            accesses[interface_name] = total_access_bytes_for_interface
+        
+        return accesses
         
     def forward(self, 
                graph: ComputationGraph, 
