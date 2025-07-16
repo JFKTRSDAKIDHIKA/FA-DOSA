@@ -192,7 +192,7 @@ class Config:
         if Config._instance is None:
             Config._instance = Config()
         return Config._instance
-
+    
 def find_divisors(n: int) -> List[int]:
     """
     Find all positive divisors of n.
@@ -2435,11 +2435,11 @@ class ConditionalPerformanceModel(nn.Module):
         
         # 获取硬件面积成本
         area_cost = hardware_params.get_area_cost()
-        
+
         # 初始化总成本
         total_latency = torch.tensor(0.0, dtype=torch.float32)
         total_energy = torch.tensor(0.0, dtype=torch.float32)
-        
+
         # 获取所有决策模块
         all_decision_modules = mapping_params.get_all_decision_modules()
         group_mapping = mapping_params.group_mapping
@@ -2482,7 +2482,7 @@ class ConditionalPerformanceModel(nn.Module):
                 # 严格遵循 Mind the Gap 论文的异构映射模板策略
                 fused_latency = torch.tensor(0.0, dtype=torch.float32)
                 fused_energy = torch.tensor(0.0, dtype=torch.float32)
-                
+
                 # 遍历融合组内的每一层，根据位置严格指定模板
                 for i, layer_name in enumerate(group_layers):
                     # 确定层的位置
@@ -2490,7 +2490,7 @@ class ConditionalPerformanceModel(nn.Module):
                         position = 'head'  # 链头
                     elif i == len(group_layers) - 1:
                         position = 'tail'  # 链尾
-                    else:
+            else:
                         position = 'middle'  # 链中
                     
                     # 获取该层对应的决策模块
@@ -2556,7 +2556,7 @@ class ConditionalPerformanceModel(nn.Module):
                 # === 基于异构映射模板策略的融合决策 ===
                 final_group_latency = p_fuse * fused_latency + (1 - p_fuse) * non_fused_latency
                 final_group_energy = p_fuse * fused_energy + (1 - p_fuse) * non_fused_energy
-            else:
+        else:
                 # 独立层，直接使用计算出的成本
                 final_group_latency = group_latency
                 final_group_energy = group_energy
@@ -2716,7 +2716,7 @@ def calculate_total_loss_with_hardware_constraints(
     
     # 组合所有组件并加权（移除面积项）
     total_loss = (
-        config.LATENCY_WEIGHT * log_latency + 
+        config.LATENCY_WEIGHT * log_latency +
         config.ENERGY_WEIGHT * log_energy + 
         # config.AREA_WEIGHT * log_area +  # 移除面积项
         config.PENALTY_WEIGHT * mapping_penalty +

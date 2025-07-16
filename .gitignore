@@ -45,6 +45,8 @@ runs/
 *.json
 *.npy
 *.npz
+*.txt
+*.png
 data/
 datasets/
 raw_data/
